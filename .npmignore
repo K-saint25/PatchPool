@@ -1,0 +1,16 @@
+# Never publish local state, credentials, or worker workspaces.
+*.sqlite
+*.sqlite-*
+.patchpool.sqlite*
+.env
+.env.*
+workspaces/
+.worktrees/
+
+# Development-only metadata and generated output.
+.superpowers/
+.github/
+node_modules/
+coverage/
+dist/
+build/

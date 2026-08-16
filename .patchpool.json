@@ -1,0 +1,5 @@
+{
+  "verifyCommand": ["npm", "test"],
+  "requiredIssueLabel": "patchpool-ready",
+  "timeoutMinutes": 30
+}
