@@ -2,14 +2,19 @@ import { DatabaseSync } from 'node:sqlite';
 import { PatchPoolError } from './errors.js';
 
 const SCHEMA_VERSION = 1;
-const ACTIVE_STATES = ['claimed', 'working', 'verifying'];
-const STATES = new Set(['claimed', 'working', 'verifying', 'completed', 'failed', 'released']);
+const ACTIVE_STATES = ['claimed', 'working', 'verifying', 'running', 'verified', 'committed', 'pushed', 'pr_opened'];
+const STATES = new Set(['claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released']);
 const BUSY_RETRY_ATTEMPTS = 20;
 const BUSY_RETRY_WAIT_MS = 10;
 const TRANSITIONS = new Map([
-  ['claimed', new Set(['working', 'failed', 'released'])],
-  ['working', new Set(['verifying', 'failed', 'released'])],
-  ['verifying', new Set(['completed', 'failed', 'released'])],
+  ['claimed', new Set(['working', 'running', 'failed', 'released'])],
+  ['working', new Set(['running', 'verifying', 'failed', 'released'])],
+  ['running', new Set(['verifying', 'verified', 'failed', 'released'])],
+  ['verifying', new Set(['verified', 'committed', 'completed', 'failed', 'released'])],
+  ['verified', new Set(['committed', 'failed', 'released'])],
+  ['committed', new Set(['pushed', 'failed', 'released'])],
+  ['pushed', new Set(['pr_opened', 'failed', 'released'])],
+  ['pr_opened', new Set(['completed'])],
   ['completed', new Set()],
   ['failed', new Set()],
   ['released', new Set()],
@@ -99,6 +104,51 @@ function withImmediateTransaction(db, operation) {
   }
 }
 
+function migrateWorkflowStates(db) {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get()?.sql ?? '';
+  if (table.includes("'running'")) return;
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.exec('BEGIN');
+    db.exec('ALTER TABLE events RENAME TO events_legacy');
+    db.exec('ALTER TABLE claims RENAME TO claims_legacy');
+    db.exec('DROP INDEX IF EXISTS claims_one_active_issue');
+    db.exec(`
+      CREATE TABLE claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repositories(id),
+        issue_number INTEGER NOT NULL CHECK (issue_number > 0),
+        worker_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released')),
+        fields_json TEXT NOT NULL DEFAULT '{}',
+        claimed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO claims (id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
+        SELECT id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at FROM claims_legacy;
+      CREATE UNIQUE INDEX claims_one_active_issue
+        ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'working', 'verifying', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        claim_id INTEGER NOT NULL REFERENCES claims(id),
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO events (id, claim_id, event_type, payload_json, created_at)
+        SELECT id, claim_id, event_type, payload_json, created_at FROM events_legacy;
+      DROP TABLE events_legacy;
+      DROP TABLE claims_legacy;
+      COMMIT;
+    `);
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* preserve migration error */ }
+    throw error;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
 export class PatchPoolStore {
   static open(path = '.patchpool.sqlite') {
     return new PatchPoolStore(path);
@@ -133,7 +183,7 @@ export class PatchPoolStore {
         repo_id INTEGER NOT NULL REFERENCES repositories(id),
         issue_number INTEGER NOT NULL CHECK (issue_number > 0),
         worker_id TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('claimed', 'working', 'verifying', 'completed', 'failed', 'released')),
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released')),
         fields_json TEXT NOT NULL DEFAULT '{}',
         claimed_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -148,6 +198,7 @@ export class PatchPoolStore {
         created_at TEXT NOT NULL
       );
     `);
+    migrateWorkflowStates(this.db);
     const version = this.db.prepare('SELECT version FROM schema_meta WHERE id = 1').get()?.version;
     if (version !== SCHEMA_VERSION) {
       this.db.close();
