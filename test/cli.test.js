@@ -29,6 +29,22 @@ function eligibleGitHub(calls = []) {
   };
 }
 
+function approvedRepositoryInput(overrides = {}) {
+  const approvedConfig = {
+    verifyCommand: [process.execPath, '--test'],
+    requiredIssueLabel: 'patchpool-ready',
+    timeoutMinutes: 30,
+  };
+  return {
+    fullName: 'octo/example',
+    configDigest: 'sha256:approved',
+    verificationArgv: [...approvedConfig.verifyCommand],
+    requiredLabel: approvedConfig.requiredIssueLabel,
+    policy: { approvedConfig },
+    ...overrides,
+  };
+}
+
 test('repo add registers an approved repository and reports JSON', async () => {
   const store = memoryStore();
   const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-add-'));
@@ -72,6 +88,42 @@ test('repo add loads and persists an approved config snapshot without a caller-p
       timeoutMinutes: 30,
     });
     assert.deepEqual(Object.keys(result.policy), ['approvedConfig']);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo add safely reapproves a legacy registration after repeating GitHub eligibility', async () => {
+  const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-reapprove-'));
+  const configPath = writeApprovedConfig(directory);
+  const calls = [];
+  try {
+    const original = store.registerRepository({
+      fullName: 'octo/reapprove',
+      configDigest: 'sha256:legacy',
+      verificationArgv: ['legacy'],
+      requiredLabel: 'legacy',
+      policy: {},
+      active: false,
+    });
+    const updated = await main(['repo', 'add', '--repo', 'octo/reapprove', '--config', configPath], {
+      store,
+      github: eligibleGitHub(calls),
+      stdout() {},
+    });
+
+    assert.deepEqual(calls, ['octo/reapprove']);
+    assert.equal(updated.id, original.id);
+    assert.equal(updated.active, true);
+    assert.match(updated.configDigest, /^sha256:[a-f0-9]{64}$/);
+    assert.deepEqual(updated.policy.approvedConfig, {
+      verifyCommand: [process.execPath, '--test'],
+      requiredIssueLabel: 'patchpool-ready',
+      timeoutMinutes: 30,
+    });
+    assert.equal(store.listRepositories().length, 1);
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -159,7 +211,7 @@ test('two CLI run compositions pass the same worker ID to the workflow', async (
   const store = memoryStore();
   const ids = [];
   try {
-    store.registerRepository({ fullName: 'octo/composed', configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    store.registerRepository(approvedRepositoryInput({ fullName: 'octo/composed' }));
     const options = {
       store,
       environment: { PATCHPOOL_WORKER_ID: '', COMPUTERNAME: 'machine-b', USERNAME: 'operator' },
@@ -169,6 +221,28 @@ test('two CLI run compositions pass the same worker ID to the workflow', async (
     await main(['run', '--repo', 'octo/composed'], options);
     await main(['run', '--repo', 'octo/composed'], options);
     assert.equal(ids[0], ids[1]);
+  } finally {
+    store.close();
+  }
+});
+
+test('CLI run rejects a legacy repository before composing or invoking a workflow', async () => {
+  const store = memoryStore();
+  let workflowCalls = 0;
+  try {
+    store.registerRepository({ fullName: 'octo/legacy', configDigest: 'sha256:legacy', verificationArgv: ['node', '--test'] });
+    await assert.rejects(
+      () => main(['run', '--repo', 'octo/legacy'], {
+        store,
+        stdout() {},
+        workflowFactory() {
+          workflowCalls += 1;
+          return { async run() { workflowCalls += 1; } };
+        },
+      }),
+      error => error.code === 'REPOSITORY_REAPPROVAL_REQUIRED' && /repo add.*--config/i.test(error.message),
+    );
+    assert.equal(workflowCalls, 0);
   } finally {
     store.close();
   }

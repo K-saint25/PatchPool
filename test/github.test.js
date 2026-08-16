@@ -108,6 +108,17 @@ test('pull request commands receive cancellation and bounded timeout options', a
   }
 });
 
+test('clone forwards cancellation and bounded timeout options to the command runner', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: '', stderr: '' }]);
+  const client = new GitHubClient({ runner });
+  const controller = new AbortController();
+  const options = { signal: controller.signal, timeoutMs: 12_345 };
+  await client.clone('octo/example', 'C:\\tmp\\patch pool', options);
+  assert.deepEqual(runner.calls[0].args, ['repo', 'clone', 'octo/example', 'C:\\tmp\\patch pool']);
+  assert.equal(runner.calls[0].options.signal, controller.signal);
+  assert.equal(runner.calls[0].options.timeoutMs, 12_345);
+});
+
 test('createDraftPullRequest rejects a response that is not verified as Draft', async () => {
   const runner = scriptedRunner([{ exitCode: 0, stdout: 'https://github.com/octo/example/pull/1\n', stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 1, url: 'https://github.com/octo/example/pull/1', isDraft: false }), stderr: '' }]);
   const client = new GitHubClient({ runner });

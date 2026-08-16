@@ -13,6 +13,21 @@ function memoryStore() {
   return PatchPoolStore.open(':memory:');
 }
 
+function approvedRepositoryInput(fullName) {
+  const approvedConfig = {
+    verifyCommand: [process.execPath, '--test'],
+    requiredIssueLabel: 'patchpool-ready',
+    timeoutMinutes: 30,
+  };
+  return {
+    fullName,
+    configDigest: 'sha256:approved',
+    verificationArgv: [...approvedConfig.verifyCommand],
+    requiredLabel: approvedConfig.requiredIssueLabel,
+    policy: { approvedConfig },
+  };
+}
+
 function authenticatedDependencies(calls = []) {
   return {
     github: {
@@ -46,12 +61,11 @@ function fileDigest(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
-test('doctor inspects an existing state database read-only without creating or migrating schema', async () => {
+test('doctor accepts a compatible PatchPool state database without changing it', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-existing-'));
   const dbPath = join(directory, 'state.sqlite');
-  const database = new DatabaseSync(dbPath);
-  database.exec("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('unchanged')");
-  database.close();
+  const state = PatchPoolStore.open(dbPath);
+  state.close();
   const before = fileDigest(dbPath);
   const calls = [];
   const output = [];
@@ -80,6 +94,7 @@ test('doctor inspects an existing state database read-only without creating or m
       writable: true,
       openable: true,
       integrity: 'ok',
+      schemaVersion: 1,
     });
     assert.deepEqual(result.checks.commitSigning, {
       ok: true,
@@ -94,9 +109,54 @@ test('doctor inspects an existing state database read-only without creating or m
       ['git', 'config', '--get', 'user.email'],
     ]);
     assert.equal(fileDigest(dbPath), before);
-    const inspected = new DatabaseSync(dbPath, { readOnly: true });
-    assert.deepEqual(inspected.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map(row => row.name), ['sentinel']);
-    inspected.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('doctor rejects an arbitrary SQLite database as incompatible without changing it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-arbitrary-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const database = new DatabaseSync(dbPath);
+  database.exec("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('unchanged')");
+  database.close();
+  const before = fileDigest(dbPath);
+  try {
+    const result = await main(['doctor', '--json'], {
+      dbPath,
+      nodeVersion: '24.15.0',
+      ...authenticatedDependencies(),
+      stdout() {},
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.checks.stateDatabase.code, 'STATE_DATABASE_SCHEMA_INCOMPATIBLE');
+    assert.equal(fileDigest(dbPath), before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('doctor rejects a future PatchPool schema version without migrating or changing it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-future-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const state = PatchPoolStore.open(dbPath);
+  state.close();
+  const database = new DatabaseSync(dbPath);
+  database.prepare('UPDATE schema_meta SET version = 2 WHERE id = 1').run();
+  database.close();
+  const before = fileDigest(dbPath);
+  try {
+    const result = await main(['doctor', '--json'], {
+      dbPath,
+      nodeVersion: '24.15.0',
+      ...authenticatedDependencies(),
+      stdout() {},
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.checks.stateDatabase.code, 'STATE_DATABASE_SCHEMA_INCOMPATIBLE');
+    assert.equal(fileDigest(dbPath), before);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -241,12 +301,7 @@ test('manual e2e dispatches the exact target in publish mode and applies its app
   const store = memoryStore();
   const calls = [];
   try {
-    store.registerRepository({
-      fullName: 'K-saint25/PatchPool',
-      configDigest: 'sha256:approved',
-      verificationArgv: [process.execPath, '--test'],
-      policy: { approvedConfig: { verifyCommand: ['npm', 'test'], requiredIssueLabel: 'patchpool-ready', timeoutMinutes: 30 } },
-    });
+    store.registerRepository(approvedRepositoryInput('K-saint25/PatchPool'));
     const result = await main(['e2e', '--repo', 'K-saint25/PatchPool', '--issue', '7', '--publish'], {
       store,
       stdout() {},
@@ -275,7 +330,7 @@ test('ordinary run still supports any approved public repository', async () => {
   const store = memoryStore();
   const calls = [];
   try {
-    store.registerRepository({ fullName: 'octo/other-public', configDigest: 'sha256:approved', verificationArgv: [process.execPath, '--test'] });
+    store.registerRepository(approvedRepositoryInput('octo/other-public'));
     await main(['run', '--repo', 'octo/other-public'], {
       store,
       stdout() {},

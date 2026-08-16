@@ -42,6 +42,31 @@ function booleanValue(value, fallback) {
   return value === true || value === 1 || value === '1' || value === 'true';
 }
 
+function normalizeRepository(input) {
+  if (!input || !input.configDigest) {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Repository configDigest is required');
+  }
+  const publicRepository = booleanValue(input.public ?? input.isPublic, true);
+  if (!publicRepository || String(input.visibility ?? '').toLowerCase() === 'private') {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
+  }
+  const fullName = canonicalFullName(input.fullName);
+  if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
+      input.verificationArgv.some(argument => typeof argument !== 'string' || argument.length === 0)) {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Repository verificationArgv must be a non-empty string array');
+  }
+  return {
+    fullName,
+    active: booleanValue(input.active, true),
+    public: publicRepository,
+    configDigest: String(input.configDigest),
+    verificationArgv: input.verificationArgv,
+    requiredLabel: input.requiredLabel ?? input.policy?.requiredLabel ?? null,
+    blockingLabels: input.blockingLabels ?? input.policy?.blockingLabels ?? [],
+    policy: input.policy ?? {},
+  };
+}
+
 function mapRepository(row) {
   if (!row) return null;
   return {
@@ -290,21 +315,8 @@ export class PatchPoolStore {
   }
 
   registerRepository(input) {
-    if (!input || !input.configDigest) {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Repository configDigest is required');
-    }
-    if (input.public === false || input.isPublic === false || String(input.visibility ?? '').toLowerCase() === 'private') {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
-    }
-    const fullName = canonicalFullName(input.fullName);
-    if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
-        input.verificationArgv.some(argument => typeof argument !== 'string' || argument.length === 0)) {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Repository verificationArgv must be a non-empty string array');
-    }
+    const repository = normalizeRepository(input);
     const timestamp = now();
-    const requiredLabel = input.requiredLabel ?? input.policy?.requiredLabel ?? null;
-    const blockingLabels = input.blockingLabels ?? input.policy?.blockingLabels ?? [];
-    const policy = input.policy ?? {};
     try {
       const result = this.db.prepare(`
         INSERT INTO repositories
@@ -312,24 +324,57 @@ export class PatchPoolStore {
            required_label, blocking_labels, policy_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        fullName,
-        booleanValue(input.active, true) ? 1 : 0,
-        booleanValue(input.public ?? input.isPublic, true) ? 1 : 0,
-        String(input.configDigest),
-        JSON.stringify(input.verificationArgv),
-        requiredLabel,
-        JSON.stringify(Array.isArray(blockingLabels) ? blockingLabels : []),
-        JSON.stringify(policy),
+        repository.fullName,
+        repository.active ? 1 : 0,
+        repository.public ? 1 : 0,
+        repository.configDigest,
+        JSON.stringify(repository.verificationArgv),
+        repository.requiredLabel,
+        JSON.stringify(Array.isArray(repository.blockingLabels) ? repository.blockingLabels : []),
+        JSON.stringify(repository.policy),
         timestamp,
         timestamp,
       );
       return this.getRepositoryById(Number(result.lastInsertRowid));
     } catch (error) {
       if (String(error?.code ?? '').includes('CONSTRAINT') || /UNIQUE constraint/i.test(error?.message ?? '')) {
-        throw new PatchPoolError('REPOSITORY_EXISTS', `Repository is already registered: ${fullName}`);
+        throw new PatchPoolError('REPOSITORY_EXISTS', `Repository is already registered: ${repository.fullName}`);
       }
       throw error;
     }
+  }
+
+  reapproveRepository(input) {
+    const repository = normalizeRepository(input);
+    return withImmediateTransaction(this.db, () => {
+      const existing = this.db.prepare('SELECT * FROM repositories WHERE full_name = ? COLLATE NOCASE').get(repository.fullName);
+      if (!existing) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${repository.fullName}`);
+      const activeClaim = this.db.prepare(`
+        SELECT id FROM claims
+        WHERE repo_id = ? AND state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened')
+        LIMIT 1
+      `).get(existing.id);
+      if (activeClaim) {
+        throw new PatchPoolError('REPOSITORY_REAPPROVAL_BUSY', 'Repository approval cannot change while a claim is active');
+      }
+      this.db.prepare(`
+        UPDATE repositories
+        SET full_name = ?, active = ?, is_public = ?, config_digest = ?, verification_argv = ?,
+            required_label = ?, policy_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        repository.fullName,
+        repository.active ? 1 : 0,
+        repository.public ? 1 : 0,
+        repository.configDigest,
+        JSON.stringify(repository.verificationArgv),
+        repository.requiredLabel,
+        JSON.stringify(repository.policy),
+        now(),
+        existing.id,
+      );
+      return this.getRepositoryById(existing.id);
+    });
   }
 
   getRepositoryById(id) {

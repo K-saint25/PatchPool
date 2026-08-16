@@ -1,8 +1,16 @@
 import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { SCHEMA_VERSION } from './store.js';
 
 const MINIMUM_NODE_MAJOR = 24;
+const REQUIRED_SCHEMA = new Map([
+  ['schema_meta', ['id', 'version']],
+  ['repositories', ['id', 'full_name', 'active', 'is_public', 'config_digest', 'verification_argv', 'required_label', 'blocking_labels', 'policy_json', 'created_at', 'updated_at']],
+  ['claims', ['id', 'repo_id', 'issue_number', 'worker_id', 'state', 'fields_json', 'claimed_at', 'updated_at']],
+  ['events', ['id', 'claim_id', 'event_type', 'payload_json', 'created_at']],
+  ['execution_leases', ['claim_id', 'worker_id', 'token', 'acquired_at', 'expires_at', 'owner_pid', 'owner_session_id']],
+]);
 
 async function checked(operation, failureCode) {
   try {
@@ -33,6 +41,22 @@ function checkParent(path) {
   }
 }
 
+function assertCompatibleSchema(database) {
+  const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
+  for (const [table, requiredColumns] of REQUIRED_SCHEMA) {
+    if (!tables.has(table)) throw stateError('STATE_DATABASE_SCHEMA_INCOMPATIBLE', 'State database is missing required PatchPool schema');
+    const columns = new Set(database.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+    if (requiredColumns.some(column => !columns.has(column))) {
+      throw stateError('STATE_DATABASE_SCHEMA_INCOMPATIBLE', 'State database is missing required PatchPool columns');
+    }
+  }
+  const metadata = database.prepare('SELECT id, version FROM schema_meta WHERE id = 1').get();
+  if (metadata?.id !== 1 || metadata?.version !== SCHEMA_VERSION) {
+    throw stateError('STATE_DATABASE_SCHEMA_INCOMPATIBLE', 'State database schema version is not supported');
+  }
+  return metadata.version;
+}
+
 function checkStateDatabase(path = '.patchpool.sqlite') {
   if (path === ':memory:') {
     return { path, exists: false, writable: true, openable: true, ephemeral: true };
@@ -49,18 +73,21 @@ function checkStateDatabase(path = '.patchpool.sqlite') {
     throw stateError('STATE_DATABASE_NOT_WRITABLE', 'Existing state database is not a readable and writable file');
   }
   let database;
+  let schemaVersion;
   try {
     database = new DatabaseSync(absolute, { readOnly: true });
     const integrity = database.prepare('PRAGMA quick_check').all();
     if (integrity.length === 0 || integrity.some(row => row.quick_check !== 'ok')) {
       throw new Error('integrity check failed');
     }
-  } catch {
+    schemaVersion = assertCompatibleSchema(database);
+  } catch (error) {
+    if (error?.code === 'STATE_DATABASE_SCHEMA_INCOMPATIBLE') throw error;
     throw stateError('STATE_DATABASE_INVALID', 'Existing state database could not be checked read-only');
   } finally {
     try { database?.close(); } catch { /* preserve the state check result */ }
   }
-  return { path, exists: true, writable: true, openable: true, integrity: 'ok' };
+  return { path, exists: true, writable: true, openable: true, integrity: 'ok', schemaVersion };
 }
 
 export async function runDoctor({

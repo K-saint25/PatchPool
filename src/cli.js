@@ -6,7 +6,7 @@ import { GitHubClient } from './github.js';
 import { CodexClient } from './codex.js';
 import { IssueWorkflow } from './workflow.js';
 import { resolveWorkerId } from './worker.js';
-import { loadRepositoryConfig } from './config.js';
+import { assertRepositoryApproval, loadRepositoryConfig } from './config.js';
 import { formatDoctor, runDoctor } from './doctor.js';
 
 const HELP = `Usage:
@@ -75,7 +75,7 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
     const commandRunner = runner ?? new CommandRunner();
     const gh = github ?? new GitHubClient({ runner: commandRunner });
     await gh.getRepository(fullName);
-    const repository = store.registerRepository({
+    const registration = {
       fullName,
       configDigest: approved.configDigest,
       verificationArgv: approved.verificationArgv,
@@ -84,7 +84,10 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
       policy: { approvedConfig: approved.approvedConfig },
       active: !options.inactive,
       public: true,
-    });
+    };
+    const repository = store.getRepository(fullName)
+      ? store.reapproveRepository(registration)
+      : store.registerRepository(registration);
     emit(stdout, repository);
     return repository;
   }
@@ -140,6 +143,7 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
     const approved = store.getRepository(fullName);
     const timeoutMinutes = approved?.policy?.approvedConfig?.timeoutMinutes;
     const approvedTimeoutMs = Number.isInteger(timeoutMinutes) ? timeoutMinutes * 60 * 1_000 : undefined;
+    assertRepositoryApproval(approved, { approvedTimeoutMs });
     const worker = workflow ?? (workflowFactory
       ? workflowFactory({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment), approvedTimeoutMs })
       : new IssueWorkflow({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment), approvedTimeoutMs }));

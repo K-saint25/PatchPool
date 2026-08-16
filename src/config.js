@@ -73,24 +73,7 @@ function rejectDuplicateTopLevelKeys(source) {
   }
 }
 
-function parseConfig(path) {
-  let source;
-  try {
-    const size = statSync(path).size;
-    if (size > MAX_CONFIG_BYTES) invalid('.patchpool.json exceeds the 64 KiB size limit');
-    source = readFileSync(path, 'utf8');
-  } catch (error) {
-    if (error?.code === 'INVALID_REPOSITORY_CONFIG') throw error;
-    throw new PatchPoolError('REPOSITORY_CONFIG_UNREADABLE', `Unable to read repository config: ${path}`);
-  }
-  let value;
-  try {
-    rejectDuplicateTopLevelKeys(source);
-    value = JSON.parse(source);
-  } catch (error) {
-    if (error?.code === 'INVALID_REPOSITORY_CONFIG') throw error;
-    invalid('.patchpool.json must contain valid JSON');
-  }
+function normalizeApprovedConfig(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid('.patchpool.json must contain a JSON object');
   const keys = Object.keys(value).sort();
   if (keys.length !== CONFIG_KEYS.length || keys.some((key, index) => key !== CONFIG_KEYS[index])) {
@@ -112,6 +95,27 @@ function parseConfig(path) {
     requiredIssueLabel: value.requiredIssueLabel,
     timeoutMinutes: value.timeoutMinutes,
   };
+}
+
+function parseConfig(path) {
+  let source;
+  try {
+    const size = statSync(path).size;
+    if (size > MAX_CONFIG_BYTES) invalid('.patchpool.json exceeds the 64 KiB size limit');
+    source = readFileSync(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'INVALID_REPOSITORY_CONFIG') throw error;
+    throw new PatchPoolError('REPOSITORY_CONFIG_UNREADABLE', `Unable to read repository config: ${path}`);
+  }
+  let value;
+  try {
+    rejectDuplicateTopLevelKeys(source);
+    value = JSON.parse(source);
+  } catch (error) {
+    if (error?.code === 'INVALID_REPOSITORY_CONFIG') throw error;
+    invalid('.patchpool.json must contain valid JSON');
+  }
+  return normalizeApprovedConfig(value);
 }
 
 function resolveVerificationArgv(verifyCommand, {
@@ -147,6 +151,33 @@ export function loadRepositoryConfig(path, options = {}) {
     configDigest: `sha256:${createHash('sha256').update(canonical).digest('hex')}`,
     verificationArgv: resolveVerificationArgv(approvedConfig.verifyCommand, options),
   };
+}
+
+function reapprovalRequired() {
+  throw new PatchPoolError(
+    'REPOSITORY_REAPPROVAL_REQUIRED',
+    'Repository approval is missing or incompatible; run patchpool repo add --repo <owner/name> --config <path> again',
+  );
+}
+
+export function assertRepositoryApproval(repository, { approvedTimeoutMs, resolutionOptions } = {}) {
+  let approvedConfig;
+  let expectedArgv;
+  try {
+    approvedConfig = normalizeApprovedConfig(repository?.policy?.approvedConfig);
+    expectedArgv = resolveVerificationArgv(approvedConfig.verifyCommand, resolutionOptions);
+  } catch {
+    reapprovalRequired();
+  }
+  const expectedTimeoutMs = approvedConfig.timeoutMinutes * 60 * 1_000;
+  const actualArgv = repository?.verificationArgv;
+  if (!Array.isArray(actualArgv) || actualArgv.length !== expectedArgv.length ||
+      actualArgv.some((argument, index) => argument !== expectedArgv[index]) ||
+      repository?.requiredLabel !== approvedConfig.requiredIssueLabel ||
+      !Number.isFinite(approvedTimeoutMs) || approvedTimeoutMs <= 0 || approvedTimeoutMs !== expectedTimeoutMs) {
+    reapprovalRequired();
+  }
+  return { approvedConfig, approvedTimeoutMs: expectedTimeoutMs };
 }
 
 export { MAX_TIMEOUT_MINUTES, MIN_TIMEOUT_MINUTES };

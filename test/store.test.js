@@ -43,6 +43,65 @@ test('registers one canonical repository and persists its approval snapshot', ()
   }
 });
 
+test('reapproves a repository atomically without replacing its identity or claim history', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const original = store.registerRepository(approvedRepo({ active: false }));
+    store.db.prepare(`
+      INSERT INTO claims (repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
+      VALUES (?, 7, 'worker-a', 'failed', '{}', ?, ?)
+    `).run(original.id, original.createdAt, original.createdAt);
+
+    const approvedConfig = {
+      verifyCommand: ['node', '--test'],
+      requiredIssueLabel: 'approved',
+      timeoutMinutes: 10,
+    };
+    const updated = store.reapproveRepository({
+      ...approvedRepo({
+        fullName: 'OCTO/EXAMPLE',
+        configDigest: 'sha256:config-v2',
+        verificationArgv: ['node', '--test'],
+        requiredLabel: 'approved',
+        policy: { approvedConfig },
+      }),
+      public: true,
+      active: true,
+    });
+
+    assert.equal(updated.id, original.id);
+    assert.equal(updated.fullName, 'OCTO/EXAMPLE');
+    assert.equal(updated.active, true);
+    assert.equal(updated.public, true);
+    assert.equal(updated.configDigest, 'sha256:config-v2');
+    assert.deepEqual(updated.verificationArgv, ['node', '--test']);
+    assert.equal(updated.requiredLabel, 'approved');
+    assert.deepEqual(updated.policy, { approvedConfig });
+    assert.deepEqual(updated.blockingLabels, original.blockingLabels);
+    assert.equal(store.getClaim(1).repoId, original.id);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reapproval refuses to replace policy while any claim is active', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const original = store.registerRepository(approvedRepo());
+    store.claimIssue({ repoId: original.id, issueNumber: 7, workerId: 'worker-a' });
+
+    assert.throws(
+      () => store.reapproveRepository(approvedRepo({ configDigest: 'sha256:config-v2' })),
+      error => error.code === 'REPOSITORY_REAPPROVAL_BUSY',
+    );
+    assert.equal(store.getRepository('octo/example').configDigest, 'sha256:config-v1');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('repository names use the same canonical owner/name grammar as the GitHub adapter', () => {
   const { store, directory } = openTempStore();
   try {
@@ -122,6 +181,7 @@ test('refuses claims for inactive and non-public repositories', () => {
     const inactive = store.registerRepository(approvedRepo({ fullName: 'octo/inactive', active: false }));
     assert.throws(() => store.claimIssue({ repoId: inactive.id, issueNumber: 1, workerId: 'worker-a' }), error => error.code === 'REPOSITORY_INACTIVE');
     assert.throws(() => store.registerRepository(approvedRepo({ fullName: 'octo/private-registration', public: false })), error => error.code === 'INVALID_REPOSITORY');
+    assert.throws(() => store.registerRepository(approvedRepo({ fullName: 'octo/private-string', public: 'false' })), error => error.code === 'INVALID_REPOSITORY');
     const privateRepo = store.registerRepository(approvedRepo({ fullName: 'octo/private' }));
     store.db.prepare('UPDATE repositories SET is_public = 0 WHERE id = ?').run(privateRepo.id);
     assert.throws(() => store.claimIssue({ repoId: privateRepo.id, issueNumber: 1, workerId: 'worker-a' }), error => error.code === 'REPOSITORY_NOT_PUBLIC');
