@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PatchPoolStore } from '../src/store.js';
@@ -272,6 +272,25 @@ test('CLI run rejects an invalid injected model before creating a workflow', asy
     } finally {
       store.close();
     }
+  }
+});
+
+test('CLI rejects an invalid model before creating the state database', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-invalid-model-db-'));
+  const dbPath = join(directory, 'state.sqlite');
+  try {
+    assert.equal(existsSync(dbPath), false);
+    await assert.rejects(
+      () => main(['run', '--repo', 'octo/no-state'], {
+        dbPath,
+        environment: { PATCHPOOL_CODEX_MODEL: 'gpt/unsafe' },
+        stdout() {},
+      }),
+      error => error.code === 'INVALID_CODEX_MODEL',
+    );
+    assert.equal(existsSync(dbPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
