@@ -131,7 +131,21 @@ dry-run first; only then use the guarded command.
   `%TEMP%` on Windows or `/tmp` on Unix-like systems. They are removed after a
   successful run unless `--keep-workspace` is used.
 - Claim states: `claimed → running → verified → committed → pushed → pr_opened`.
-  Failures are persisted as `failed` with an error code and timestamps.
+  Pre-push failures are persisted as `failed` with an error code and timestamps.
+  After a remote side effect may exist, the worker retains `pushed` or
+  `pr_opened` so a retry can reconcile it safely.
+
+Inspect the local claim history as JSON without changing claim or lease state:
+
+```text
+node bin/patchpool.js claim list --json
+```
+
+Rows are ordered by claim `id` ascending. The output includes repository and
+workflow status fields, but omits execution lease tokens and arbitrary claim
+metadata. If the state database does not exist, the command returns `[]`
+without creating it. It never migrates a database; legacy, future, malformed,
+or otherwise incompatible state is rejected without modification.
 
 The SQLite claim and execution lease coordinate workers sharing one state DB on
 one computer only. They are not a distributed lock or a service scheduler.
@@ -140,8 +154,16 @@ one computer only. They are not a distributed lock or a service scheduler.
 
 The worker persists each external side effect. Keep the same `PATCHPOOL_DB` and
 the same worker identity (`PATCHPOOL_WORKER_ID`, when set) when retrying. A
-dry-run that reached `verified`, or a normal crash before completion, resumes by
-rerunning the same command with the same issue:
+dry-run that reached `verified`, or a normal crash before completion, can be
+inspected before retrying:
+
+```text
+node bin/patchpool.js claim list --json
+```
+
+Use the matching claim's `state`, `workspace`, `branch`, `commitSha`, `prUrl`,
+and `errorCode` to decide whether to inspect or retry it. Then rerun the same
+command with the same issue:
 
 ```text
 node bin/patchpool.js run --repo K-saint25/PatchPool --issue <issue-number>

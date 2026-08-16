@@ -156,6 +156,71 @@ test('only one active claim can own a repository issue', () => {
   }
 });
 
+test('lists sanitized claims with repository names in stable id order without mutating state', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const repository = store.registerRepository(approvedRepo());
+    let first = store.claimIssue({ repoId: repository.id, issueNumber: 9, workerId: 'worker-a', expectedConfigDigest: repository.configDigest });
+    first = store.transitionClaim(first.id, 'running', { branch: 'patchpool/issue-9-1', workspace: 'C:\\worktree', secret: 'do-not-expose' });
+    first = store.transitionClaim(first.id, 'verified');
+    first = store.transitionClaim(first.id, 'committed', { commitSha: 'abc123' });
+    first = store.transitionClaim(first.id, 'pushed');
+    first = store.transitionClaim(first.id, 'pr_opened', { prUrl: 'https://github.com/octo/example/pull/1' });
+    const lease = store.acquireExecutionLease(first.id, first.workerId);
+
+    let second = store.claimIssue({ repoId: repository.id, issueNumber: 10, workerId: 'worker-b', expectedConfigDigest: repository.configDigest });
+    second = store.transitionClaim(second.id, 'failed', { errorCode: 'CODEX_RATE_LIMIT' });
+    const before = {
+      events: store.db.prepare('SELECT COUNT(*) AS count FROM events').get().count,
+      claims: store.db.prepare('SELECT id, state, fields_json, updated_at FROM claims ORDER BY id').all(),
+    };
+
+    const claims = store.listClaims();
+
+    assert.deepEqual(claims, [
+      {
+        id: first.id,
+        repoId: repository.id,
+        repositoryFullName: 'octo/example',
+        issueNumber: 9,
+        workerId: 'worker-a',
+        state: 'pr_opened',
+        branch: 'patchpool/issue-9-1',
+        workspace: 'C:\\worktree',
+        commitSha: 'abc123',
+        prUrl: 'https://github.com/octo/example/pull/1',
+        errorCode: null,
+        claimedAt: first.claimedAt,
+        updatedAt: first.updatedAt,
+      },
+      {
+        id: second.id,
+        repoId: repository.id,
+        repositoryFullName: 'octo/example',
+        issueNumber: 10,
+        workerId: 'worker-b',
+        state: 'failed',
+        branch: null,
+        workspace: null,
+        commitSha: null,
+        prUrl: null,
+        errorCode: 'CODEX_RATE_LIMIT',
+        claimedAt: second.claimedAt,
+        updatedAt: second.updatedAt,
+      },
+    ]);
+    assert.equal(JSON.stringify(claims).includes(lease.token), false);
+    assert.equal(JSON.stringify(claims).includes('do-not-expose'), false);
+    assert.deepEqual({
+      events: store.db.prepare('SELECT COUNT(*) AS count FROM events').get().count,
+      claims: store.db.prepare('SELECT id, state, fields_json, updated_at FROM claims ORDER BY id').all(),
+    }, before);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('claim transaction rejects an approval digest that changed after repository validation', () => {
   const { store, directory } = openTempStore();
   try {

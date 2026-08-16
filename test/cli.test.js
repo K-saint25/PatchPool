@@ -1,14 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { PatchPoolStore } from '../src/store.js';
-import { main, resolveWorkerId } from '../src/cli.js';
+import { HELP, main, resolveWorkerId } from '../src/cli.js';
 import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 function memoryStore() {
   return PatchPoolStore.open(':memory:');
+}
+
+function fileSnapshot(path) {
+  return {
+    bytes: readFileSync(path),
+    mtimeNs: statSync(path, { bigint: true }).mtimeNs,
+  };
+}
+
+function schemaVersion(path) {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return database.prepare('SELECT version FROM schema_meta WHERE id = 1').get()?.version;
+  } finally {
+    database.close();
+  }
 }
 
 function writeApprovedConfig(directory, verifyCommand = [process.execPath, '--test']) {
@@ -355,6 +372,159 @@ test('claim resolves the repository and creates an issue claim', async () => {
   } finally {
     store.close();
   }
+});
+
+test('claim list --json emits the read-only sanitized claim view', async () => {
+  const store = memoryStore();
+  const output = [];
+  try {
+    const repository = store.registerRepository(approvedRepositoryInput());
+    const claim = store.claimIssue({ repoId: repository.id, issueNumber: 7, workerId: 'worker-a', expectedConfigDigest: repository.configDigest });
+    store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-7-1', workspace: 'C:\\work', secret: 'hidden' });
+    const before = store.db.prepare('SELECT COUNT(*) AS count FROM events').get().count;
+
+    const result = await main(['claim', 'list', '--json'], { store, stdout: value => output.push(value) });
+
+    assert.deepEqual(result, store.listClaims());
+    assert.deepEqual(JSON.parse(output.join('')), result);
+    assert.deepEqual(Object.keys(result[0]), [
+      'id', 'repoId', 'repositoryFullName', 'issueNumber', 'workerId', 'state', 'branch',
+      'workspace', 'commitSha', 'prUrl', 'errorCode', 'claimedAt', 'updatedAt',
+    ]);
+    assert.equal(JSON.stringify(result).includes('hidden'), false);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, before);
+  } finally {
+    store.close();
+  }
+});
+
+test('claim list requires JSON and rejects unsupported arguments', async () => {
+  for (const argv of [
+    ['claim', 'list'],
+    ['claim', 'list', '--repo', 'octo/example'],
+    ['claim', 'list', '--unknown', 'value'],
+    ['claim', 'list', '--private'],
+    ['claim', 'list', 'unexpected', '--json'],
+  ]) {
+    const store = memoryStore();
+    try {
+      await assert.rejects(
+        () => main(argv, { store, stdout() {} }),
+        error => error.code === 'INVALID_ARGS' && /claim list/i.test(error.message),
+      );
+    } finally {
+      store.close();
+    }
+  }
+});
+
+test('claim list returns an empty array for missing state without creating it or validating a model', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-claim-list-missing-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const output = [];
+  try {
+    const result = await main(['claim', 'list', '--json'], {
+      dbPath,
+      environment: { PATCHPOOL_CODEX_MODEL: 'invalid/model' },
+      stdout: value => output.push(value),
+    });
+    assert.deepEqual(result, []);
+    assert.deepEqual(JSON.parse(output.join('')), []);
+    assert.equal(existsSync(dbPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('claim list reads a current state database without changing bytes, mtime, or schema metadata', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-claim-list-current-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const state = PatchPoolStore.open(dbPath);
+  const repository = state.registerRepository(approvedRepositoryInput());
+  state.claimIssue({ repoId: repository.id, issueNumber: 12, workerId: 'worker-read-only', expectedConfigDigest: repository.configDigest });
+  state.close();
+  const before = fileSnapshot(dbPath);
+  try {
+    const result = await main(['claim', 'list', '--json'], {
+      dbPath,
+      environment: { PATCHPOOL_CODEX_MODEL: 'invalid/model' },
+      stdout() {},
+    });
+    assert.equal(result[0].issueNumber, 12);
+    assert.equal(schemaVersion(dbPath), 1);
+    assert.deepEqual(fileSnapshot(dbPath), before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('claim list rejects legacy state without migrating or changing it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-claim-list-legacy-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const database = new DatabaseSync(dbPath);
+  database.exec(`
+    CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+    INSERT INTO schema_meta VALUES (1, 1);
+    CREATE TABLE repositories (
+      id INTEGER PRIMARY KEY, full_name TEXT NOT NULL, active INTEGER NOT NULL,
+      is_public INTEGER NOT NULL, config_digest TEXT NOT NULL, verification_argv TEXT NOT NULL,
+      required_label TEXT, blocking_labels TEXT NOT NULL, policy_json TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    INSERT INTO repositories VALUES (1, 'octo/legacy', 1, 1, 'sha256:legacy', '[]', NULL, '[]', '{}', 'before', 'before');
+    CREATE TABLE claims (
+      id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, issue_number INTEGER NOT NULL,
+      worker_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed','working','verifying','completed','failed','released')),
+      fields_json TEXT NOT NULL, claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    INSERT INTO claims VALUES (1, 1, 3, 'worker-legacy', 'working', '{}', 'before', 'before');
+    CREATE TABLE events (id INTEGER PRIMARY KEY, claim_id INTEGER NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE execution_leases (claim_id INTEGER PRIMARY KEY, worker_id TEXT NOT NULL, token TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+  `);
+  database.close();
+  const before = fileSnapshot(dbPath);
+  try {
+    await assert.rejects(
+      () => main(['claim', 'list', '--json'], { dbPath, stdout() {} }),
+      error => error.code === 'STATE_DATABASE_INCOMPATIBLE',
+    );
+    assert.equal(schemaVersion(dbPath), 1);
+    assert.deepEqual(fileSnapshot(dbPath), before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('claim list rejects future, arbitrary, and malformed databases without changing them', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-claim-list-invalid-'));
+  const futurePath = join(directory, 'future.sqlite');
+  const future = PatchPoolStore.open(futurePath);
+  future.close();
+  const futureWriter = new DatabaseSync(futurePath);
+  futureWriter.prepare('UPDATE schema_meta SET version = 99 WHERE id = 1').run();
+  futureWriter.close();
+  const arbitraryPath = join(directory, 'arbitrary.sqlite');
+  const arbitrary = new DatabaseSync(arbitraryPath);
+  arbitrary.exec('CREATE TABLE sentinel (value TEXT NOT NULL)');
+  arbitrary.close();
+  const malformedPath = join(directory, 'malformed.sqlite');
+  writeFileSync(malformedPath, 'not a SQLite database');
+  try {
+    for (const dbPath of [futurePath, arbitraryPath, malformedPath]) {
+      const before = fileSnapshot(dbPath);
+      await assert.rejects(
+        () => main(['claim', 'list', '--json'], { dbPath, stdout() {} }),
+        error => error.code === 'STATE_DATABASE_INCOMPATIBLE',
+      );
+      assert.deepEqual(fileSnapshot(dbPath), before);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('help documents the JSON claim list command', () => {
+  assert.match(HELP, /patchpool claim list --json/);
 });
 
 test('claim rejects legacy, malformed, argv-mismatched, and tampered approvals without creating a claim', async () => {
