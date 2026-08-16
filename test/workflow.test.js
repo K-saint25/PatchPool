@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PatchPoolStore } from '../src/store.js';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 test('workflow module is present', async () => {
   const module = await import('../src/workflow.js');
@@ -16,9 +19,9 @@ function setup({ verificationExitCode = 0 } = {}) {
     async getIssue(name, number) { calls.push(['issue', number]); return { number, title: 'Fix', body: 'body', state: 'OPEN', assignees: [], labels: [] }; },
     async listIssues() { return []; },
     async clone(name, directory) { calls.push(['clone', directory]); },
-    async getPushRemote() { calls.push(['permission']); return { canPush: true }; },
+    async getPushRemote() { calls.push(['permission']); return { canPush: true, remoteName: 'origin' }; },
     async findPullRequest() { calls.push(['find-pr']); return null; },
-    async createDraftPullRequest() { calls.push(['create-pr']); return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: 'patchpool/issue-1-1' }; },
+    async createDraftPullRequest(input) { calls.push(['create-pr']); return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body }; },
   };
   const runner = {
     async run(command, args, options) {
@@ -55,6 +58,9 @@ test('failed approved verification does not commit', async () => {
   const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_VERIFICATION_FAILED');
   assert.equal(setupState.calls.some(call => call[0] === 'run' && call[2]?.[0] === 'commit'), false);
+  const failed = setupState.store.db.prepare('SELECT fields_json FROM claims ORDER BY id DESC LIMIT 1').get();
+  assert.equal(JSON.parse(failed.fields_json).error, undefined);
+  assert.equal(JSON.parse(failed.fields_json).errorCode, 'WORKFLOW_VERIFICATION_FAILED');
   setupState.store.close();
 });
 
@@ -64,7 +70,7 @@ test('publish disables hooks, refreshes issue before push, and creates one Draft
   setupState.github.createDraftPullRequest = async input => {
     created = input;
     setupState.calls.push(['create-pr']);
-    return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: input.branch };
+    return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body };
   };
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
@@ -91,7 +97,7 @@ test('ambiguous PR creation reconciles the existing matching Draft PR without re
   let creates = 0;
   setupState.github.findPullRequest = async () => {
     lookups += 1;
-    return lookups === 1 ? null : { url: 'https://github.com/octo/example/pull/9', isDraft: true, headRefName: 'patchpool/issue-1-1' };
+    return lookups === 1 ? null : { url: 'https://github.com/octo/example/pull/9', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' };
   };
   setupState.github.createDraftPullRequest = async () => {
     creates += 1;
@@ -119,5 +125,109 @@ test('rejects a pull-request-shaped issue before cloning or claiming', async () 
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_PULL_REQUEST');
   assert.equal(setupState.store.listRepositories().length, 1);
   assert.equal(setupState.calls.some(call => call[0] === 'clone'), false);
+  setupState.store.close();
+});
+
+test('rejects verification that mutates the same changed path', async () => {
+  const setupState = setup();
+  const directory = await mkdtemp(join(tmpdir(), 'patchpool-fingerprint-'));
+  setupState.runner.run = async (command, args, options) => {
+    setupState.calls.push(['run', command, args]);
+    if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: ' M src/app.js\0', stderr: '' };
+    if (command === 'git' && args[0] === 'diff') return { exitCode: 0, stdout: '', stderr: '' };
+    if (command === 'npm') {
+      await mkdir(join(directory, 'src'), { recursive: true });
+      await writeFile(join(directory, 'src', 'app.js'), 'mutated');
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  setupState.codex.implement = async () => { await mkdir(join(directory, 'src'), { recursive: true }); await writeFile(join(directory, 'src', 'app.js'), 'before'); };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => directory, cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_VERIFICATION_MUTATED');
+  await rm(directory, { recursive: true, force: true });
+  setupState.store.close();
+});
+
+test('rejects a changed symlink before verification', async () => {
+  if (process.platform === 'win32') return;
+  const setupState = setup();
+  const directory = await mkdtemp(join(tmpdir(), 'patchpool-symlink-'));
+  setupState.runner.run = async (command, args) => {
+    setupState.calls.push(['run', command, args]);
+    if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: '?? docs/link\0', stderr: '' };
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  setupState.codex.implement = async () => { await mkdir(join(directory, 'docs'), { recursive: true }); await symlink('outside', join(directory, 'docs', 'link')); };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => directory, cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_SYMLINK');
+  await rm(directory, { recursive: true, force: true });
+  setupState.store.close();
+});
+
+test('rejects a rename record whose destination is a secret path', async () => {
+  const setupState = setup();
+  setupState.runner.run = async (command, args) => {
+    setupState.calls.push(['run', command, args]);
+    if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: 'R  safe.txt\0.env\0', stderr: '' };
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_SUSPICIOUS_FILE');
+  setupState.store.close();
+});
+
+test('resumes a pushed claim by reconciling its PR without running Codex or pushing again', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1' });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc' });
+  setupState.store.transitionClaim(claim.id, 'pushed');
+  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true });
+  assert.equal(result.state, 'pr_opened');
+  assert.equal(setupState.calls.some(call => call[0] === 'codex'), false);
+  assert.equal(setupState.calls.some(call => call[0] === 'run' && call[2]?.[0] === 'push'), false);
+  setupState.store.close();
+});
+
+test('rejects malformed push permission and missing PR reconciliation fields', async () => {
+  const setupState = setup();
+  setupState.github.getPushRemote = async () => ({ canPush: true });
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_PUSH_PERMISSION');
+  setupState.store.close();
+});
+
+test('strips credential environment variables while preserving Codex operational paths', async () => {
+  const setupState = setup();
+  let codexEnvironment;
+  let verifierEnvironment;
+  setupState.codex.implement = async options => { codexEnvironment = options.env; };
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'npm') verifierEnvironment = options.env;
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, environment: { PATH: 'safe', CODEX_HOME: 'codex-home', APPDATA: 'appdata', GITHUB_TOKEN: 'github-secret', OPENAI_API_KEY: 'openai-secret', AWS_SECRET_ACCESS_KEY: 'aws-secret', RANDOM_VALUE: 'drop' }, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
+  assert.deepEqual(codexEnvironment, { PATH: 'safe', CODEX_HOME: 'codex-home', APPDATA: 'appdata' });
+  assert.deepEqual(verifierEnvironment, codexEnvironment);
+  setupState.store.close();
+});
+
+test('surfaces cleanup failure as a stable workflow error', async () => {
+  const setupState = setup();
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => { throw new Error('cleanup failed'); } });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_CLEANUP_FAILED');
   setupState.store.close();
 });

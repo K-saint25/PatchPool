@@ -63,3 +63,10 @@ test('implement maps timeout, rate limit, nonzero, failed events, and missing te
     await assert.rejects(() => client.implement({ cwd: '.', prompt: 'x' }), error => error.code === code);
   }
 });
+
+test('implement forwards the sanitized environment when provided', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: '{"type":"turn.completed"}\n', stderr: '' }]);
+  const client = new CodexClient({ runner });
+  await client.implement({ cwd: 'C:\\repo', prompt: 'prompt', env: { PATH: 'safe' } });
+  assert.deepEqual(runner.calls[0].options.env, { PATH: 'safe' });
+});

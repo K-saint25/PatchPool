@@ -22,6 +22,16 @@ test('repo add registers an approved repository and reports JSON', async () => {
   }
 });
 
+test('repo add defaults verification to the Windows-safe Node test executable', async () => {
+  const store = memoryStore();
+  try {
+    const result = await main(['repo', 'add', '--repo', 'octo/default', '--config-digest', 'sha256:one'], { store, stdout() {} });
+    assert.deepEqual(result.verificationArgv, [process.execPath, '--test']);
+  } finally {
+    store.close();
+  }
+});
+
 test('repo list --json prints all registered repositories as JSON', async () => {
   const store = memoryStore();
   const output = [];

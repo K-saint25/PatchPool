@@ -1,7 +1,9 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import * as defaultFilesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { PatchPoolError } from './errors.js';
 import { evaluateIssueEligibility } from './policy.js';
 import { buildImplementationPrompt } from './prompt.js';
@@ -36,22 +38,44 @@ function issueNumber(issue, requested) {
   return number;
 }
 
-function outputLines(stdout) {
-  return String(stdout ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-}
-
-function changedPaths(stdout) {
-  return outputLines(stdout).map(line => line.length > 3 && /^[ MADRCU?!]{2}\s/.test(line) ? line.slice(3) : line);
-}
-
-function untrackedPaths(stdout) {
-  return outputLines(stdout).filter(line => /^\?\?\s/.test(line)).map(line => line.slice(3));
+function parseStatus(stdout) {
+  const value = String(stdout ?? '');
+  const tokens = value.includes('\0') ? value.split('\0') : value.split(/\r?\n/);
+  const paths = [];
+  const untracked = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const record = tokens[index];
+    if (!record || record.length < 3 || !/^[ MADRCU?!]{2} /.test(record)) continue;
+    const status = record.slice(0, 2);
+    const path = record.slice(3);
+    if (!path) continue;
+    paths.push(path);
+    if (status === '??') untracked.push(path);
+    if (status[0] === 'R' || status[0] === 'C') {
+      const original = tokens[index + 1];
+      if (original !== undefined && original !== '') {
+        paths.push(original);
+        index += 1;
+      }
+    }
+  }
+  return { paths: [...new Set(paths)], untracked: [...new Set(untracked)] };
 }
 
 function sameSet(a, b) {
   if (a.size !== b.size) return false;
   for (const item of a) if (!b.has(item)) return false;
   return true;
+}
+
+function sanitizeEnvironment(source = process.env) {
+  const allow = /^(?:PATH|PATHEXT|SystemRoot|SYSTEMROOT|TEMP|TMP|TMPDIR|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|CODEX_HOME|ComSpec|COMSPEC|windir|USER|USERNAME|LANG|LC_[A-Z_]+|NODE_PATH)$/i;
+  const secret = /(?:GH|GITHUB|OPENAI|AWS|AZURE|GOOGLE|CLOUD|TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i;
+  const result = {};
+  for (const [name, value] of Object.entries(source ?? {})) {
+    if (allow.test(name) && !secret.test(name) && value !== undefined) result[name] = String(value);
+  }
+  return result;
 }
 
 function defaultTempDirectoryFactory(prefix) {
@@ -70,15 +94,15 @@ function pullRequestRepository(pr, side) {
 function validatePullRequest(pr, repository, base, branch, issueNumberValue) {
   if (!pr || typeof pr !== 'object') throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Reconciled pull request response is invalid');
   if (pr.isDraft !== true) throw new PatchPoolError('WORKFLOW_PR_NOT_DRAFT', 'Pull request is not Draft');
-  if (pr.headRefName !== undefined && pr.headRefName !== branch) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request head does not match the worker branch');
+  if (pr.headRefName !== branch) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request head does not match the worker branch');
   const baseRef = pr.baseRefName ?? pr.baseBranch ?? pr.base?.ref;
-  if (baseRef !== undefined && baseRef !== base) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request base does not match the repository default branch');
+  if (baseRef !== base) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request base does not match the repository default branch');
   const baseRepository = pullRequestRepository(pr, 'base');
-  if (baseRepository !== undefined && baseRepository !== repository) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request base repository does not match the requested repository');
+  if (baseRepository !== repository) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request base repository does not match the requested repository');
   const headRepository = pullRequestRepository(pr, 'head');
-  if (headRepository !== undefined && headRepository !== repository) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request head repository does not match the requested repository');
+  if (headRepository !== repository) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request head repository does not match the requested repository');
   if (typeof pr.url !== 'string' || !new RegExp(`^https://github\\.com/${escapeRegex(repository)}/pull/\\d+$`).test(pr.url)) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request URL is invalid or belongs to another repository');
-  if (typeof pr.body === 'string' && (!/AI-assisted implementation/i.test(pr.body) || !new RegExp(`/issues/${issueNumberValue}\\b`).test(pr.body))) throw new PatchPoolError('WORKFLOW_PR_DISCLOSURE_MISSING', 'Pull request body must contain the AI disclosure and Issue link');
+  if (typeof pr.body !== 'string' || !/AI-assisted implementation/i.test(pr.body) || !new RegExp(`Closes #${issueNumberValue}\\b`).test(pr.body)) throw new PatchPoolError('WORKFLOW_PR_DISCLOSURE_MISSING', 'Pull request body must contain the AI disclosure and Issue link');
   return pr;
 }
 
@@ -95,6 +119,9 @@ export class IssueWorkflow {
     randomId = randomUUID,
     promptBuilder = buildImplementationPrompt,
     codexTimeoutMs,
+    filesystem = defaultFilesystem,
+    environment = process.env,
+    hooksDirectoryFactory = defaultTempDirectoryFactory,
   } = {}) {
     if (!store || typeof store.getRepository !== 'function' || typeof store.claimIssue !== 'function' || typeof store.transitionClaim !== 'function') throw new TypeError('IssueWorkflow requires a PatchPoolStore');
     if (!github) throw new TypeError('IssueWorkflow requires a GitHubClient');
@@ -111,6 +138,9 @@ export class IssueWorkflow {
     this.randomId = randomId;
     this.promptBuilder = promptBuilder;
     this.codexTimeoutMs = codexTimeoutMs;
+    this.filesystem = filesystem;
+    this.environment = environment;
+    this.hooksDirectoryFactory = hooksDirectoryFactory;
   }
 
   async command(args, cwd, code, operation) {
@@ -136,8 +166,48 @@ export class IssueWorkflow {
   }
 
   async status(directory) {
-    const result = await this.command(['status', '--porcelain'], directory, 'WORKFLOW_GIT_FAILED', 'Unable to inspect worktree status');
-    return { all: changedPaths(result.stdout), untracked: untrackedPaths(result.stdout) };
+    const result = await this.command(['status', '--porcelain=v1', '-z', '--untracked-files=all'], directory, 'WORKFLOW_GIT_FAILED', 'Unable to inspect worktree status');
+    return parseStatus(result.stdout);
+  }
+
+  async fingerprint(directory, status) {
+    const root = resolve(directory);
+    const rootReal = await this.filesystem.realpath(root).catch(() => root);
+    const result = new Map();
+    for (const path of status.paths) {
+      if (SECRET_FILE.test(path)) throw new PatchPoolError('WORKFLOW_SUSPICIOUS_FILE', 'Codex produced a suspicious secret-like filename');
+      const absolute = resolve(root, path);
+      const relativePath = relative(root, absolute);
+      if (!relativePath || relativePath.startsWith('..') || relativePath.includes('..' + '\\') || relativePath.includes('../') || absolute === root) throw new PatchPoolError('WORKFLOW_PATH_ESCAPE', 'Changed path escapes the isolated worktree');
+      let stat;
+      try { stat = await this.filesystem.lstat(absolute); } catch (error) {
+        if (error?.code === 'ENOENT') { result.set(path, 'missing'); continue; }
+        throw new PatchPoolError('WORKFLOW_FILE_INSPECTION_FAILED', 'Unable to inspect a changed path');
+      }
+      if (stat.isSymbolicLink()) throw new PatchPoolError('WORKFLOW_SYMLINK', 'Changed symlinks are not allowed');
+      const parts = relative(root, absolute).split(/[\\/]/).filter(Boolean);
+      let parent = root;
+      for (const part of parts.slice(0, -1)) {
+        parent = join(parent, part);
+        try {
+          if ((await this.filesystem.lstat(parent)).isSymbolicLink()) throw new PatchPoolError('WORKFLOW_SYMLINK', 'Changed paths through symlinked directories are not allowed');
+        } catch (error) {
+          if (error instanceof PatchPoolError) throw error;
+          break;
+        }
+      }
+      const resolved = await this.filesystem.realpath(absolute).catch(() => absolute);
+      const resolvedRelative = relative(rootReal, resolved);
+      if (resolvedRelative.startsWith('..') || resolvedRelative.includes('..' + '\\') || resolvedRelative.includes('../')) throw new PatchPoolError('WORKFLOW_PATH_ESCAPE', 'Changed path resolves outside the isolated worktree');
+      let content;
+      try { content = await this.filesystem.readFile(absolute); } catch (error) {
+        if (error?.code === 'EISDIR') content = Buffer.from('<directory>');
+        else throw new PatchPoolError('WORKFLOW_FILE_INSPECTION_FAILED', 'Unable to fingerprint a changed path');
+      }
+      const digest = createHash('sha256').update(content).digest('hex');
+      result.set(path, `${stat.mode & 0o7777}:${digest}`);
+    }
+    return result;
   }
 
   async assertEligible(repository, issue) {
@@ -166,10 +236,30 @@ export class IssueWorkflow {
     const current = this.store.getClaim?.(claim.id);
     if (!current || ['failed', 'released', 'completed', 'pr_opened'].includes(current.state)) return;
     try {
-      this.store.transitionClaim(claim.id, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', error: error.message, failedAt: this.clock() });
+      this.store.transitionClaim(claim.id, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() });
     } catch {
       // Preserve the original workflow error if the store itself is unavailable.
     }
+  }
+
+  async openPullRequest({ fullName, base, branch, number, title, publish }) {
+    let found = await this.github.findPullRequest(fullName, branch);
+    if (found) return validatePullRequest(found, fullName, base, branch, number);
+    if (!publish) throw new PatchPoolError('WORKFLOW_PR_NOT_FOUND', 'Published Draft pull request was not found');
+    const body = `## PatchPool\n\nAI-assisted implementation generated by the local PatchPool worker. A human maintainer must review the changes.\n\nCloses #${number} (https://github.com/${fullName}/issues/${number})`;
+    let created;
+    try {
+      created = await this.github.createDraftPullRequest({ repository: fullName, branch, base, title: title ?? `Resolve issue #${number}`, body });
+    } catch (createError) {
+      const reconciled = await this.github.findPullRequest(fullName, branch).catch(() => null);
+      if (!reconciled) throw createError;
+      return validatePullRequest(reconciled, fullName, base, branch, number);
+    }
+    return validatePullRequest({ ...created, body: created.body ?? body }, fullName, base, branch, number);
+  }
+
+  async cleanupPath(path, code = 'WORKFLOW_CLEANUP_FAILED') {
+    try { await this.cleanup(path); } catch { throw new PatchPoolError(code, 'Unable to clean up the temporary workflow directory'); }
   }
 
   async run({ repo, issueNumber: requestedIssueNumber, publish = false, keepWorkspace = false } = {}) {
@@ -181,6 +271,7 @@ export class IssueWorkflow {
 
     let claim;
     let workspace;
+    let hooksDirectory;
     let commitSha;
     let pr;
     let branch;
@@ -198,74 +289,74 @@ export class IssueWorkflow {
         if (!issue) throw new PatchPoolError('WORKFLOW_NO_ELIGIBLE_ISSUE', 'No eligible issue is available');
       }
       const number = issueNumber(issue, requestedIssueNumber);
-      claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId, fields: { title: issue.title, claimedAt: this.clock() } });
+      claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId });
 
       const refreshed = await this.refresh(fullName, number, { ...approved, ...canonical });
-      const runId = String(claim.id ?? this.randomId());
-      branch = `patchpool/issue-${number}-${runId}`;
-      workspace = await this.tempDirectoryFactory(`patchpool-${number}-${runId}-`);
+      branch = claim.branch ?? `patchpool/issue-${number}-${String(claim.id ?? this.randomId())}`;
+      const base = refreshed.repository.defaultBranch ?? canonical.defaultBranch ?? 'main';
+      if (claim.state === 'pr_opened') return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha: claim.commitSha, prUrl: claim.prUrl, workspace: keepWorkspace ? claim.workspace : undefined };
+      if (claim.state === 'pushed') {
+        pr = await this.openPullRequest({ fullName, base, branch, number, title: refreshed.issue.title, publish });
+        claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() });
+        return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha: claim.commitSha, prUrl: pr.url };
+      }
+      if (claim.state === 'committed' && claim.workspace) workspace = claim.workspace;
+      if (!workspace) workspace = await this.tempDirectoryFactory(`patchpool-${number}-${String(claim.id ?? this.randomId())}-`);
       await this.github.clone(fullName, workspace);
-      claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
       await this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch');
+      if (claim.state === 'claimed') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
 
-      const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
-      await this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs });
-      claim = await this.transition(claim, 'verifying', { codexCompletedAt: this.clock() });
-      const afterCodex = await this.status(workspace);
-      const paths = [...afterCodex.all, ...afterCodex.untracked];
-      if (paths.length === 0) throw new PatchPoolError('WORKFLOW_NO_CHANGES', 'Codex produced no worktree changes');
-      if (paths.some(path => SECRET_FILE.test(path))) throw new PatchPoolError('WORKFLOW_SUSPICIOUS_FILE', 'Codex produced a suspicious secret-like filename');
-      await this.invoke('git', ['diff', '--check'], { cwd: workspace }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Git diff check failed');
-
-      const verification = [...approved.verificationArgv];
-      if (!verification.length || verification.some(argument => typeof argument !== 'string' || !argument)) throw new PatchPoolError('WORKFLOW_INVALID_VERIFICATION', 'Repository verification argv is invalid');
-      await this.invoke(verification[0], verification.slice(1), { cwd: workspace }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed');
-      const afterVerification = await this.status(workspace);
-      const beforeVerificationPaths = new Set(afterCodex.all);
-      const verificationAdded = afterVerification.all.filter(path => !beforeVerificationPaths.has(path));
-      if (verificationAdded.length > 0 || !sameSet(new Set(afterCodex.untracked), new Set(afterVerification.untracked))) throw new PatchPoolError('WORKFLOW_VERIFICATION_ADDED_FILES', 'Verification added files to the worktree');
-      claim = await this.transition(claim, 'verified', { verifiedAt: this.clock() });
+      if (claim.state !== 'committed') {
+        const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
+        await this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs, env: sanitizeEnvironment(this.environment) });
+        const afterCodex = await this.status(workspace);
+        if (afterCodex.paths.length === 0) throw new PatchPoolError('WORKFLOW_NO_CHANGES', 'Codex produced no worktree changes');
+        const beforeVerification = await this.fingerprint(workspace, afterCodex);
+        await this.invoke('git', ['diff', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Git diff check failed');
+        const verification = [...approved.verificationArgv];
+        if (!verification.length || verification.some(argument => typeof argument !== 'string' || !argument)) throw new PatchPoolError('WORKFLOW_INVALID_VERIFICATION', 'Repository verification argv is invalid');
+        await this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed');
+        const afterVerification = await this.status(workspace);
+        const afterFingerprint = await this.fingerprint(workspace, afterVerification);
+        if (!sameSet(new Set(beforeVerification.keys()), new Set(afterFingerprint.keys())) || [...beforeVerification].some(([path, digest]) => afterFingerprint.get(path) !== digest)) throw new PatchPoolError('WORKFLOW_VERIFICATION_MUTATED', 'Verification changed the worktree');
+        claim = await this.transition(claim, 'verified', { verifiedAt: this.clock() });
+      }
 
       if (!publish) return { state: claim.state, claimId: claim.id, issueNumber: number, branch, workspace: keepWorkspace ? workspace : undefined };
-
+      hooksDirectory = await this.hooksDirectoryFactory('patchpool-hooks-');
       await this.command(['add', '-A'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to stage the worktree changes');
-      await this.invoke('git', ['-c', 'core.hooksPath=NUL', 'commit', '--no-verify', '-m', `PatchPool: resolve issue #${number}`], { cwd: workspace }, 'WORKFLOW_COMMIT_FAILED', 'Unable to commit the worktree changes');
-      commitSha = (await this.command(['rev-parse', 'HEAD'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to resolve the commit SHA')).stdout.trim();
-      claim = await this.transition(claim, 'committed', { commitSha, committedAt: this.clock() });
-
+      await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, '-c', 'commit.gpgSign=false', 'diff', '--cached', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Staged diff check failed');
+      if (claim.state === 'verified') {
+        await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, '-c', 'commit.gpgSign=false', 'commit', '--no-verify', '-m', `PatchPool: resolve issue #${number}`], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_COMMIT_FAILED', 'Unable to commit the worktree changes');
+        commitSha = (await this.command(['rev-parse', 'HEAD'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to resolve the commit SHA')).stdout.trim();
+        claim = await this.transition(claim, 'committed', { commitSha, workspace, committedAt: this.clock() });
+      } else commitSha = claim.commitSha;
       const beforePush = await this.refresh(fullName, number, { ...approved, ...canonical });
       const pushPermission = await this.github.getPushRemote({ fullName });
-      if (pushPermission?.canPush === false) throw new PatchPoolError('WORKFLOW_PUSH_FORBIDDEN', `No push permission for ${fullName}`);
-      await this.invoke('git', ['push', '--set-upstream', 'origin', branch], { cwd: workspace }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch');
+      if (!pushPermission || pushPermission.canPush !== true) throw new PatchPoolError('WORKFLOW_PUSH_PERMISSION', `Push permission could not be verified for ${fullName}`);
+      const remoteName = pushPermission.remoteName;
+      if (typeof remoteName !== 'string' || !/^[A-Za-z0-9._-]+$/.test(remoteName)) throw new PatchPoolError('WORKFLOW_PUSH_PERMISSION', 'Push remote name is invalid');
+      await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, 'push', '--set-upstream', remoteName, branch], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch');
       claim = await this.transition(claim, 'pushed', { pushedAt: this.clock() });
-
-      const base = beforePush.repository.defaultBranch ?? canonical.defaultBranch ?? 'main';
-      let found = await this.github.findPullRequest(fullName, branch);
-      if (found) {
-        pr = validatePullRequest(found, fullName, base, branch, number);
-      } else {
-        const body = `## PatchPool\n\nAI-assisted implementation generated by the local PatchPool worker. A human maintainer must review the changes.\n\nCloses https://github.com/${fullName}/issues/${number}`;
-        try {
-          pr = await this.github.createDraftPullRequest({ repository: fullName, branch, base, title: beforePush.issue.title ?? issue.title ?? `Resolve issue #${number}`, body });
-        } catch (createError) {
-          const reconciled = await this.github.findPullRequest(fullName, branch).catch(() => null);
-          if (!reconciled) throw createError;
-          pr = validatePullRequest(reconciled, fullName, base, branch, number);
-        }
-        pr = validatePullRequest(pr, fullName, base, branch, number);
-      }
-      claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, pullRequestUrl: pr.url, openedAt: this.clock() });
+      if (!publish) return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, workspace: keepWorkspace ? workspace : undefined };
+      pr = await this.openPullRequest({ fullName, base: beforePush.repository.defaultBranch ?? base, branch, number, title: beforePush.issue.title ?? issue.title, publish });
+      claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() });
       return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, prUrl: pr.url, workspace: keepWorkspace ? workspace : undefined };
     } catch (cause) {
       const error = asError(cause);
       await this.fail(claim, error);
       throw error;
     } finally {
-      if (workspace && !keepWorkspace) {
-        try { await this.cleanup(workspace); } catch { /* cleanup must not hide the workflow result */ }
+      let cleanupFailure;
+      if (hooksDirectory) {
+        try { await this.cleanup(hooksDirectory); } catch { cleanupFailure = true; }
       }
+      if (workspace && !keepWorkspace) {
+        try { await this.cleanup(workspace); } catch { cleanupFailure = true; }
+      }
+      if (cleanupFailure) throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
     }
   }
 }
 
-export { isPullRequest, validatePullRequest };
+export { isPullRequest, validatePullRequest, sanitizeEnvironment, parseStatus };

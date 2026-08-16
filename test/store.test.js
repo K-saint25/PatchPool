@@ -152,3 +152,20 @@ test('validates claim transitions and records transition events', () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('active running and verified claims prevent a different worker from taking the issue', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-a' });
+    const running = store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-8-1' });
+    assert.equal(running.state, 'running');
+    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+    const verified = store.transitionClaim(claim.id, 'verified');
+    assert.equal(verified.state, 'verified');
+    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

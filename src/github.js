@@ -64,6 +64,12 @@ function outputUrl(stdout) {
   return trimmed.split(/\s+/).find(value => /^https:\/\/github\.com\//.test(value));
 }
 
+const PR_JSON_FIELDS = 'number,url,isDraft,headRefName,baseRefName,headRepository,baseRepository,body';
+
+function prRepository(value) {
+  return value?.fullName ?? value?.nameWithOwner ?? value?.full_name;
+}
+
 export class GitHubClient {
   constructor({ runner, command = 'gh' } = {}) {
     if (!runner || typeof runner.run !== 'function') throw new TypeError('GitHubClient requires a CommandRunner');
@@ -143,6 +149,7 @@ export class GitHubClient {
       ...value,
       fullName: canonical,
       canPush: true,
+      remoteName: 'origin',
       remote: value.sshUrl ?? value.ssh_url ?? value.pushUrl ?? value.clone_url ?? value.url,
     };
   }
@@ -150,7 +157,7 @@ export class GitHubClient {
   async findPullRequest(fullName, branch) {
     const canonical = requireFullName(fullName);
     if (typeof branch !== 'string' || branch.length === 0 || /[\r\n]/.test(branch)) throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch is required');
-    const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all'], 'pull request lookup');
+    const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all', '--json', PR_JSON_FIELDS], 'pull request lookup');
     const value = jsonArray(result.stdout, 'pull request lookup');
     return value.find(pr => pr?.headRefName === branch) ?? null;
   }
@@ -168,13 +175,13 @@ export class GitHubClient {
     const createdUrl = structured && typeof structured === 'object' && !Array.isArray(structured) ? structured.url ?? structured.html_url : outputUrl(create.stdout);
     const url = requirePullRequestUrl(createdUrl, canonical);
     if (!url) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub pull request creation returned no URL');
-    const verifyResult = await this.run(['pr', 'view', url, '--json', 'number,url,isDraft,headRefName'], 'pull request verification');
+    const verifyResult = await this.run(['pr', 'view', url, '--json', PR_JSON_FIELDS], 'pull request verification');
     const verified = jsonObject(verifyResult.stdout, 'pull request verification');
-    if (verified.isDraft !== true || (verified.headRefName !== undefined && verified.headRefName !== branch)) {
+    if (verified.isDraft !== true || verified.headRefName !== branch || verified.baseRefName !== base || prRepository(verified.baseRepository) !== canonical || prRepository(verified.headRepository) !== canonical || typeof verified.body !== 'string') {
       throw new PatchPoolError('GITHUB_PR_NOT_DRAFT', 'Created pull request was not verified as Draft');
     }
     const verifiedUrl = verified.url === undefined ? url : requirePullRequestUrl(verified.url, canonical);
     if (verifiedUrl !== url) throw new PatchPoolError('GITHUB_PR_MISMATCH', 'Verified pull request did not match the created pull request');
-    return { ...verified, url: verifiedUrl, isDraft: true };
+    return { ...verified, url: verifiedUrl, isDraft: true, body: verified.body };
   }
 }

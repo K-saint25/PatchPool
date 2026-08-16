@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { PatchPoolError } from './errors.js';
 
 const SCHEMA_VERSION = 1;
-const ACTIVE_STATES = ['claimed', 'working', 'verifying', 'running', 'verified', 'committed', 'pushed', 'pr_opened'];
+const ACTIVE_STATES = ['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened'];
 const STATES = new Set(['claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released']);
 const BUSY_RETRY_ATTEMPTS = 20;
 const BUSY_RETRY_WAIT_MS = 10;
@@ -11,7 +11,7 @@ const TRANSITIONS = new Map([
   ['working', new Set(['running', 'verifying', 'failed', 'released'])],
   ['running', new Set(['verifying', 'verified', 'failed', 'released'])],
   ['verifying', new Set(['verified', 'committed', 'completed', 'failed', 'released'])],
-  ['verified', new Set(['committed', 'failed', 'released'])],
+  ['verified', new Set(['verified', 'committed', 'failed', 'released'])],
   ['committed', new Set(['pushed', 'failed', 'released'])],
   ['pushed', new Set(['pr_opened', 'failed', 'released'])],
   ['pr_opened', new Set(['completed'])],
@@ -127,7 +127,7 @@ function migrateWorkflowStates(db) {
       INSERT INTO claims (id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
         SELECT id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at FROM claims_legacy;
       CREATE UNIQUE INDEX claims_one_active_issue
-        ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'working', 'verifying', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
+        ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
       CREATE TABLE events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         claim_id INTEGER NOT NULL REFERENCES claims(id),
@@ -189,7 +189,7 @@ export class PatchPoolStore {
         updated_at TEXT NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS claims_one_active_issue
-        ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'working', 'verifying');
+        ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         claim_id INTEGER NOT NULL REFERENCES claims(id),
@@ -277,6 +277,12 @@ export class PatchPoolStore {
       if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Unknown repository id: ${repoId}`);
       if (!repository.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${repository.fullName}`);
       if (!repository.public) throw new PatchPoolError('REPOSITORY_NOT_PUBLIC', `Repository is not public: ${repository.fullName}`);
+      const existing = this.db.prepare(`SELECT * FROM claims WHERE repo_id = ? AND issue_number = ? AND state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened')`).get(repoId, issueNumber);
+      if (existing) {
+        const mapped = mapClaim(existing);
+        if (mapped.workerId === workerId) return mapped;
+        throw new PatchPoolError('CLAIM_EXISTS', `Issue ${issueNumber} already has an active claim`);
+      }
       const timestamp = now();
       try {
         const result = this.db.prepare(`

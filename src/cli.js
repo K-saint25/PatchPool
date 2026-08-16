@@ -44,7 +44,7 @@ function required(options, key, label = key) {
 
 function parseVerificationArgv(options) {
   const value = options.verification_argv ?? options.verify_argv;
-  if (value === undefined) return ['npm', 'test'];
+  if (value === undefined) return [process.execPath, '--test'];
   let parsed;
   try { parsed = JSON.parse(value); } catch {
     throw new PatchPoolError('INVALID_ARGS', '--verification-argv must be a JSON string array');
