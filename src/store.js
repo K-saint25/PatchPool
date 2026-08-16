@@ -393,26 +393,34 @@ export class PatchPoolStore {
     const repoId = Number(input?.repoId);
     const issueNumber = Number(input?.issueNumber);
     const workerId = String(input?.workerId ?? '').trim();
-    if (!Number.isInteger(repoId) || repoId < 1 || !Number.isInteger(issueNumber) || issueNumber < 1 || !workerId) {
-      throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, and workerId are required');
+    const expectedConfigDigest = String(input?.expectedConfigDigest ?? '').trim();
+    if (!Number.isInteger(repoId) || repoId < 1 || !Number.isInteger(issueNumber) || issueNumber < 1 || !workerId || !expectedConfigDigest) {
+      throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, workerId, and expectedConfigDigest are required');
     }
     return withImmediateTransaction(this.db, () => {
       const repository = this.getRepositoryById(repoId);
       if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Unknown repository id: ${repoId}`);
       if (!repository.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${repository.fullName}`);
       if (!repository.public) throw new PatchPoolError('REPOSITORY_NOT_PUBLIC', `Repository is not public: ${repository.fullName}`);
+      if (repository.configDigest !== expectedConfigDigest) {
+        throw new PatchPoolError('REPOSITORY_APPROVAL_CHANGED', 'Repository approval changed before the claim transaction');
+      }
       const existing = this.db.prepare(`SELECT * FROM claims WHERE repo_id = ? AND issue_number = ? AND state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened')`).get(repoId, issueNumber);
       if (existing) {
         const mapped = mapClaim(existing);
+        if (mapped.approvalConfigDigest !== expectedConfigDigest) {
+          throw new PatchPoolError('REPOSITORY_APPROVAL_CHANGED', 'Active claim belongs to another repository approval generation');
+        }
         if (mapped.workerId === workerId) return mapped;
         throw new PatchPoolError('CLAIM_EXISTS', `Issue ${issueNumber} already has an active claim`);
       }
       const timestamp = now();
+      const fields = { ...(input.fields ?? {}), approvalConfigDigest: expectedConfigDigest };
       try {
         const result = this.db.prepare(`
           INSERT INTO claims (repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
           VALUES (?, ?, ?, 'claimed', ?, ?, ?)
-        `).run(repoId, issueNumber, workerId, JSON.stringify(input.fields ?? {}), timestamp, timestamp);
+        `).run(repoId, issueNumber, workerId, JSON.stringify(fields), timestamp, timestamp);
         const claim = this.getClaim(Number(result.lastInsertRowid));
         this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
           .run(claim.id, 'claimed', JSON.stringify({ workerId }), timestamp);
@@ -457,7 +465,9 @@ export class PatchPoolStore {
     if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
       throw new PatchPoolError('INVALID_TRANSITION', 'Transition fields must be an object');
     }
-    const merged = { ...json(current.fields_json, {}), ...fields };
+    const currentFields = json(current.fields_json, {});
+    const merged = { ...currentFields, ...fields };
+    if (Object.hasOwn(currentFields, 'approvalConfigDigest')) merged.approvalConfigDigest = currentFields.approvalConfigDigest;
     const timestamp = now();
     this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
       .run(state, JSON.stringify(merged), timestamp, claimId);
@@ -493,8 +503,10 @@ export class PatchPoolStore {
     if (!current) throw new PatchPoolError('CLAIM_NOT_FOUND', `Unknown claim id: ${claimId}`);
     if (current.state !== 'committed') throw new PatchPoolError('INVALID_TRANSITION', `Cannot restart claim from ${current.state}`);
     const merged = { ...json(current.fields_json, {}) };
+    const approvalConfigDigest = merged.approvalConfigDigest;
     for (const key of ['commitSha', 'committedAt', 'verifiedAt', 'workspace', 'pushedAt', 'prUrl', 'openedAt', 'errorCode', 'failedAt', 'startedAt', 'restartAt']) delete merged[key];
     Object.assign(merged, fields);
+    if (approvalConfigDigest !== undefined) merged.approvalConfigDigest = approvalConfigDigest;
     const timestamp = now();
     this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
       .run('running', JSON.stringify(merged), timestamp, claimId);

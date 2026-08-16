@@ -139,16 +139,21 @@ function resolveVerificationArgv(verifyCommand, {
   return [...verifyCommand];
 }
 
-export function loadRepositoryConfig(path, options = {}) {
-  const approvedConfig = parseConfig(path);
+export function digestApprovedRepositoryConfig(value) {
+  const approvedConfig = normalizeApprovedConfig(value);
   const canonical = JSON.stringify({
     verifyCommand: approvedConfig.verifyCommand,
     requiredIssueLabel: approvedConfig.requiredIssueLabel,
     timeoutMinutes: approvedConfig.timeoutMinutes,
   });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+export function loadRepositoryConfig(path, options = {}) {
+  const approvedConfig = parseConfig(path);
   return {
     approvedConfig,
-    configDigest: `sha256:${createHash('sha256').update(canonical).digest('hex')}`,
+    configDigest: digestApprovedRepositoryConfig(approvedConfig),
     verificationArgv: resolveVerificationArgv(approvedConfig.verifyCommand, options),
   };
 }
@@ -170,8 +175,10 @@ export function assertRepositoryApproval(repository, { approvedTimeoutMs, resolu
     reapprovalRequired();
   }
   const expectedTimeoutMs = approvedConfig.timeoutMinutes * 60 * 1_000;
+  const expectedDigest = digestApprovedRepositoryConfig(approvedConfig);
   const actualArgv = repository?.verificationArgv;
-  if (!Array.isArray(actualArgv) || actualArgv.length !== expectedArgv.length ||
+  if (repository?.configDigest !== expectedDigest ||
+      !Array.isArray(actualArgv) || actualArgv.length !== expectedArgv.length ||
       actualArgv.some((argument, index) => argument !== expectedArgv[index]) ||
       repository?.requiredLabel !== approvedConfig.requiredIssueLabel ||
       !Number.isFinite(approvedTimeoutMs) || approvedTimeoutMs <= 0 || approvedTimeoutMs !== expectedTimeoutMs) {

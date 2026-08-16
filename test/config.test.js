@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { loadRepositoryConfig } from '../src/config.js';
+import { assertRepositoryApproval, loadRepositoryConfig } from '../src/config.js';
 
 function withConfig(value, operation) {
   const directory = mkdtempSync(join(tmpdir(), 'patchpool-config-'));
@@ -29,6 +29,32 @@ test('loads the exact config schema and computes a canonical digest internally',
     assert.deepEqual(loaded.approvedConfig, APPROVED);
     assert.deepEqual(loaded.verificationArgv, ['npm', 'test']);
   });
+});
+
+test('runtime approval rejects a tampered or malformed digest for the canonical snapshot', () => {
+  const repository = {
+    configDigest: 'sha256:c397b0f2d7973a2a11e2ad711578d0c7a5ee9a0655e1cea7278c2031de21b002',
+    verificationArgv: ['npm', 'test'],
+    requiredLabel: 'patchpool-ready',
+    policy: { approvedConfig: APPROVED },
+  };
+  assert.doesNotThrow(() => assertRepositoryApproval(repository, {
+    approvedTimeoutMs: 30 * 60 * 1_000,
+    resolutionOptions: { platform: 'linux' },
+  }));
+  for (const configDigest of [
+    'sha256:0397b0f2d7973a2a11e2ad711578d0c7a5ee9a0655e1cea7278c2031de21b002',
+    'sha256:corrupt',
+    '',
+  ]) {
+    assert.throws(
+      () => assertRepositoryApproval({ ...repository, configDigest }, {
+        approvedTimeoutMs: 30 * 60 * 1_000,
+        resolutionOptions: { platform: 'linux' },
+      }),
+      error => error.code === 'REPOSITORY_REAPPROVAL_REQUIRED',
+    );
+  }
 });
 
 test('rejects missing, extra, malformed, and out-of-bounds config values', () => {

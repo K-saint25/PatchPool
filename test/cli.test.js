@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PatchPoolStore } from '../src/store.js';
 import { main, resolveWorkerId } from '../src/cli.js';
+import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 function memoryStore() {
   return PatchPoolStore.open(':memory:');
@@ -37,7 +38,7 @@ function approvedRepositoryInput(overrides = {}) {
   };
   return {
     fullName: 'octo/example',
-    configDigest: 'sha256:approved',
+    configDigest: digestApprovedRepositoryConfig(approvedConfig),
     verificationArgv: [...approvedConfig.verifyCommand],
     requiredLabel: approvedConfig.requiredIssueLabel,
     policy: { approvedConfig },

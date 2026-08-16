@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { PatchPoolStore } from '../src/store.js';
 import { main } from '../src/cli.js';
+import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 function memoryStore() {
   return PatchPoolStore.open(':memory:');
@@ -21,7 +22,7 @@ function approvedRepositoryInput(fullName) {
   };
   return {
     fullName,
-    configDigest: 'sha256:approved',
+    configDigest: digestApprovedRepositoryConfig(approvedConfig),
     verificationArgv: [...approvedConfig.verifyCommand],
     requiredLabel: approvedConfig.requiredIssueLabel,
     policy: { approvedConfig },

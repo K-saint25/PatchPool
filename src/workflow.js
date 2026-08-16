@@ -436,7 +436,12 @@ export class IssueWorkflow {
         if (!issue) throw new PatchPoolError('WORKFLOW_NO_ELIGIBLE_ISSUE', 'No eligible issue is available');
       }
       const number = issueNumber(issue, requestedIssueNumber);
-      claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId });
+      claim = this.store.claimIssue({
+        repoId: approved.id,
+        issueNumber: number,
+        workerId: this.workerId,
+        expectedConfigDigest: approved.configDigest,
+      });
       if (typeof this.store.acquireExecutionLease === 'function') {
         const lease = this.store.acquireExecutionLease(claim.id, this.workerId, {
           ttlMs: this.leaseTtlMs,

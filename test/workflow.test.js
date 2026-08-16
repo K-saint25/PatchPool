@@ -4,6 +4,7 @@ import { PatchPoolStore } from '../src/store.js';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 test('workflow module is present', async () => {
   const module = await import('../src/workflow.js');
@@ -16,13 +17,14 @@ const APPROVED_CONFIG = {
   timeoutMinutes: 30,
 };
 const APPROVED_TIMEOUT_MS = 30 * 60 * 1_000;
+const APPROVED_CONFIG_DIGEST = digestApprovedRepositoryConfig(APPROVED_CONFIG);
 const REQUIRED_LABELS = ['patchpool-ready'];
 
-function setup({ verificationExitCode = 0 } = {}) {
-  const store = PatchPoolStore.open(':memory:');
+function setup({ verificationExitCode = 0, storePath = ':memory:' } = {}) {
+  const store = PatchPoolStore.open(storePath);
   const repository = store.registerRepository({
     fullName: 'octo/example',
-    configDigest: 'sha256:approved',
+    configDigest: APPROVED_CONFIG_DIGEST,
     verificationArgv: [...APPROVED_CONFIG.verifyCommand],
     requiredLabel: APPROVED_CONFIG.requiredIssueLabel,
     policy: { approvedConfig: APPROVED_CONFIG },
@@ -89,6 +91,41 @@ test('workflow rejects a runtime timeout that does not match the approved timeou
   assert.deepEqual(setupState.calls, []);
   assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
   setupState.store.close();
+});
+
+test('workflow claim transaction rejects a concurrent two-connection reapproval before executing old policy', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'patchpool-workflow-approval-race-'));
+  const path = join(directory, 'state.sqlite');
+  const setupState = setup({ storePath: path });
+  const approvingStore = PatchPoolStore.open(path);
+  const nextApprovedConfig = { ...APPROVED_CONFIG, timeoutMinutes: 31 };
+  setupState.github.getIssue = async (name, number) => {
+    setupState.calls.push(['issue', number]);
+    approvingStore.reapproveRepository({
+      fullName: name,
+      configDigest: digestApprovedRepositoryConfig(nextApprovedConfig),
+      verificationArgv: [...nextApprovedConfig.verifyCommand],
+      requiredLabel: nextApprovedConfig.requiredIssueLabel,
+      policy: { approvedConfig: nextApprovedConfig },
+      public: true,
+      active: true,
+    });
+    return { number, title: 'Fix', body: 'body', state: 'OPEN', assignees: [], labels: REQUIRED_LABELS };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'must-not-run', cleanup: async () => {} });
+  try {
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+      error => error.code === 'REPOSITORY_APPROVAL_CHANGED',
+    );
+    assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+    assert.equal(setupState.calls.some(call => ['clone', 'codex'].includes(call[0])), false);
+  } finally {
+    approvingStore.close();
+    setupState.store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('dry-run claims only after eligibility, runs Codex, and never commits, pushes, or creates a PR', async () => {
@@ -292,7 +329,7 @@ test('rejects a rename record whose destination is a secret path', async () => {
 
 test('resumes a pushed claim by reconciling its PR without running Codex or pushing again', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc' });
@@ -370,7 +407,7 @@ test('surfaces cleanup failure as a stable workflow error', async () => {
 
 test('committed resume reuses a matching workspace without cloning', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'worktree' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'worktree' });
@@ -391,7 +428,7 @@ test('committed resume reuses a matching workspace without cloning', async () =>
 
 test('committed resume with an unusable workspace restarts from running in a fresh directory', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'missing-worktree' });
@@ -476,7 +513,7 @@ test('execution lease prevents concurrent same-worker workflows from running Cod
 
 test('restart from a non-reusable committed claim clears stage-specific metadata', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree', startedAt: 'old-start', errorCode: 'old-error' });
   setupState.store.transitionClaim(claim.id, 'verified', { verifiedAt: 'old-verify' });
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'old-sha', committedAt: 'old-time', workspace: 'missing-worktree' });

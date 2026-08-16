@@ -109,7 +109,7 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
     }
     const repository = store.getRepository(fullName);
     if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${fullName}`);
-    const claim = store.claimIssue({ repoId: repository.id, issueNumber, workerId });
+    const claim = store.claimIssue({ repoId: repository.id, issueNumber, workerId, expectedConfigDigest: repository.configDigest });
     emit(stdout, claim);
     return claim;
   }
