@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CommandRunner } from '../src/runner.js';
 
 function scriptedSpawn(calls, result = {}) {
@@ -19,13 +22,16 @@ function scriptedSpawn(calls, result = {}) {
   };
 }
 
-function hangingSpawn() {
+function hangingSpawn(signals) {
   return () => {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     child.stdin = { end() {} };
-    child.kill = () => child.emit('close', null, 'SIGTERM');
+    child.kill = signal => {
+      signals.push(signal);
+      process.nextTick(() => child.emit('close', 0, null));
+    };
     return child;
   };
 }
@@ -42,11 +48,18 @@ test('passes an argv array without a shell', async () => {
 });
 
 test('maps an expired process to COMMAND_TIMEOUT', async () => {
-  const runner = new CommandRunner({ spawnFn: hangingSpawn() });
-  await assert.rejects(
-    () => runner.run('codex', ['exec'], { timeoutMs: 5 }),
-    error => error.code === 'COMMAND_TIMEOUT',
-  );
+  const signals = [];
+  const runner = new CommandRunner({ spawnFn: hangingSpawn(signals) });
+  let timeoutError;
+  try {
+    await runner.run('codex', ['exec'], { timeoutMs: 5 });
+  } catch (error) {
+    timeoutError = error;
+  }
+  assert.equal(timeoutError?.code, 'COMMAND_TIMEOUT');
+  assert.deepEqual(signals, ['SIGTERM']);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timeoutError?.code, 'COMMAND_TIMEOUT');
 });
 
 test('returns captured stdout and stderr and closes stdin', async () => {
@@ -77,4 +90,63 @@ test('returns a non-zero exit code with output details', async () => {
   });
   const result = await runner.run('tool', []);
   assert.deepEqual(result, { exitCode: 7, stdout: '', stderr: 'bad command' });
+});
+
+test('redacts caller secrets and common GitHub/OpenAI tokens from output and errors', async () => {
+  const callerSecret = 'caller-secret-value';
+  const githubToken = 'ghp_test-token-value';
+  const openAiToken = 'sk-test-token-value';
+  const runner = new CommandRunner({
+    spawnFn: scriptedSpawn([], {
+      code: 0,
+      stdout: `stdout ${callerSecret} ${githubToken}`,
+      stderr: `stderr ${openAiToken}`,
+    }),
+  });
+  const result = await runner.run('tool', [], { sensitiveValues: [callerSecret] });
+  const resultText = JSON.stringify(result);
+  assert.equal(resultText.includes(callerSecret), false);
+  assert.equal(resultText.includes(githubToken), false);
+  assert.equal(resultText.includes(openAiToken), false);
+
+  const errorRunner = new CommandRunner({
+    spawnFn: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { end() {} };
+      process.nextTick(() => {
+        child.stderr.emit('data', `${callerSecret} ${githubToken} ${openAiToken}`);
+        const processError = new Error(`failed with ${callerSecret} ${githubToken} ${openAiToken}`);
+        processError.name = `Error-${githubToken}`;
+        child.emit('error', processError);
+      });
+      return child;
+    },
+  });
+  await assert.rejects(
+    () => errorRunner.run('tool', [], { sensitiveValues: [callerSecret] }),
+    error => {
+      const errorText = JSON.stringify(error);
+      assert.equal(errorText.includes(callerSecret), false);
+      assert.equal(errorText.includes(githubToken), false);
+      assert.equal(errorText.includes(openAiToken), false);
+      assert.equal(error.details.cause.name.includes(githubToken), false);
+      return true;
+    },
+  );
+});
+
+test('executes argv safely in a Windows cwd containing spaces', { skip: process.platform !== 'win32' }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'patchpool runner '));
+  try {
+    const runner = new CommandRunner();
+    const script = 'process.stdout.write(JSON.stringify({ argv: process.argv[1], cwd: process.cwd() }))';
+    const result = await runner.run(process.execPath, ['-e', script, 'value with spaces & symbols'], { cwd });
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.argv, 'value with spaces & symbols');
+    assert.equal(parsed.cwd, cwd);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });

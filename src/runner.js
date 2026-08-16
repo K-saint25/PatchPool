@@ -2,6 +2,38 @@ import { spawn } from 'node:child_process';
 import { PatchPoolError } from './errors.js';
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const REDACTED = '[REDACTED]';
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function createRedactor(sensitiveValues = []) {
+  const exactValues = sensitiveValues
+    .filter(value => value !== undefined && value !== null && String(value).length > 0)
+    .map(value => String(value));
+  const tokenPattern = /(?:github_pat_[A-Za-z0-9_-]{4,}|gh[pousr]_[A-Za-z0-9_-]{4,}|sk-(?:proj-|admin-|svcacct-)?[A-Za-z0-9_-]{4,})/g;
+
+  return value => {
+    let text = String(value ?? '');
+    for (const sensitiveValue of exactValues) {
+      text = text.replace(new RegExp(escapeRegExp(sensitiveValue), 'g'), REDACTED);
+    }
+    return text.replace(tokenPattern, REDACTED);
+  };
+}
+
+function safeCause(cause, redact) {
+  if (cause && typeof cause === 'object') {
+    const safe = {
+      name: redact(cause.name),
+      message: redact(cause.message ?? String(cause)),
+    };
+    if (cause.code !== undefined) safe.code = redact(cause.code);
+    return safe;
+  }
+  return redact(cause);
+}
 
 function appendLimited(chunks, state, value, maxBytes) {
   if (state.bytes >= maxBytes) return;
@@ -21,15 +53,17 @@ function spawnOptionsFrom(options) {
 }
 
 export class CommandRunner {
-  constructor({ spawnFn = spawn, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES } = {}) {
+  constructor({ spawnFn = spawn, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, sensitiveValues = [] } = {}) {
     this.spawnFn = spawnFn;
     this.maxOutputBytes = maxOutputBytes;
+    this.sensitiveValues = sensitiveValues;
   }
 
   run(command, args = [], options = {}) {
     const timeoutMs = options.timeoutMs;
     const maxOutputBytes = options.maxOutputBytes ?? options.maxCaptureBytes ?? this.maxOutputBytes;
     const spawnOptions = spawnOptionsFrom(options);
+    const redact = createRedactor([...this.sensitiveValues, ...(options.sensitiveValues ?? [])]);
 
     return new Promise((resolve, reject) => {
       const stdoutChunks = [];
@@ -42,8 +76,8 @@ export class CommandRunner {
       let timedOut = false;
 
       const output = () => ({
-        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-        stderr: Buffer.concat(stderrChunks).toString('utf8'),
+        stdout: redact(Buffer.concat(stdoutChunks).toString('utf8')),
+        stderr: redact(Buffer.concat(stderrChunks).toString('utf8')),
       });
 
       const finish = (fn, value) => {
@@ -56,7 +90,9 @@ export class CommandRunner {
       try {
         child = this.spawnFn(command, args, spawnOptions);
       } catch (cause) {
-        finish(reject, new PatchPoolError('COMMAND_FAILED', `Failed to start command: ${command}`, { cause }));
+        finish(reject, new PatchPoolError('COMMAND_FAILED', `Failed to start command: ${redact(command)}`, {
+          cause: safeCause(cause, redact),
+        }));
         return;
       }
 
@@ -64,9 +100,9 @@ export class CommandRunner {
       child.stderr?.on('data', chunk => appendLimited(stderrChunks, stderrState, chunk, maxOutputBytes));
       child.once('error', cause => {
         const captured = output();
-        finish(reject, new PatchPoolError('COMMAND_FAILED', `Failed to run command: ${command}`, {
+        finish(reject, new PatchPoolError('COMMAND_FAILED', `Failed to run command: ${redact(command)}`, {
           ...captured,
-          cause,
+          cause: safeCause(cause, redact),
         }));
       });
       child.once('close', (exitCode, signal) => {
@@ -87,7 +123,7 @@ export class CommandRunner {
           } catch {
             // The process may have exited between the timeout and kill attempt.
           }
-          finish(reject, new PatchPoolError('COMMAND_TIMEOUT', `Command timed out: ${command}`, {
+          finish(reject, new PatchPoolError('COMMAND_TIMEOUT', `Command timed out: ${redact(command)}`, {
             timeoutMs,
             ...captured,
           }));
