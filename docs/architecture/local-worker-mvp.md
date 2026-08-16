@@ -64,7 +64,9 @@ approved configuration snapshot. Omitting `--config` loads `.patchpool.json`
 from the current working directory. The `verifyCommand` is executed as argv,
 never through a shell. `timeoutMinutes` bounds both Codex implementation and
 the configured verification command; clone, push, and pull-request operations
-use separate bounded adapter deadlines.
+use separate bounded adapter deadlines and abort when the execution lease is
+lost. A legacy approved-config record must be explicitly reapproved with
+`repo add --config .patchpool.json`.
 
 The default database is `.patchpool.sqlite` in the current directory (or the
 `PATCHPOOL_DB` path). Worktrees are created below the OS temporary directory
@@ -79,21 +81,23 @@ worker signing is disabled. It does not claim issues or change the state DB.
 
 - A failed Codex or verification step is persisted as `failed`; fix the local
   cause and rerun after checking the recorded workspace and claim.
-- A dry-run's `verified` claim is intentionally retained as a fail-safe. Stop
-  the worker, resolve `PATCHPOOL_DB` (or the default `.patchpool.sqlite`), and
-  back up the database plus adjacent `-wal`/`-shm` files before using supported
-  state-recovery tooling. Never delete claim or lease rows just to unblock a
-  retry.
-- If process termination cannot be confirmed, the run stays pending. Do not
-  start another worker until the process and its descendants have been checked.
+- A dry-run's `verified` claim is intentionally retained as a fail-safe. Keep
+  the same `PATCHPOOL_DB` and worker identity, then rerun the same `run` or
+  `e2e --issue` command to resume. A normal crash follows the same path.
+- If process termination cannot be confirmed, the run stays pending. Wait until
+  the process tree is confirmed stopped before starting another worker.
 - Windows termination uses `taskkill` by PID. PID reuse is a small residual
   risk even though termination is bounded and confirmation is attempted.
-- An expired legacy execution lease with no owner PID/session metadata cannot
-  be safely attributed to a dead process and therefore requires manual state
-  recovery; it is never automatically reclaimed.
-- If a branch was pushed, inspect its GitHub branch and Draft PR before retrying;
-  the workflow should reconcile the recorded remote side effect rather than
-  create a duplicate.
+- An expired owner lease can be retried after confirming the owner process is
+  dead and the lease has expired. An expired legacy ownerless lease cannot be
+  safely attributed to a dead process and is never automatically reclaimed.
+- For a pushed or ambiguous result, inspect the GitHub branch and Draft PR,
+  then rerun the same command so the workflow reconciles the remote side effect.
+- For an ownerless legacy lease, stop all workers, resolve `PATCHPOOL_DB`, and
+  back up the database plus adjacent `-wal`/`-shm` files. Only if the run was
+  never published and has no remote side effect may the database be moved aside
+  and a new state path registered with `repo add --config .patchpool.json`.
+  Otherwise do not edit the DB; contact a maintainer.
 - The same SQLite database provides a local lock on one PC only. Two separate
   computers can still claim the same GitHub issue; central scheduling and
   distributed locks are outside this MVP.

@@ -66,8 +66,9 @@ node bin/patchpool.js repo list --json
 
 If `--config` is omitted, the CLI automatically loads `.patchpool.json` from
 the current working directory. Registration is immutable in the current store:
-to change an approved policy, use a new local state database or perform an
-explicitly reviewed manual migration.
+to change an approved policy, use `repo add --config .patchpool.json` again for
+explicit reapproval (and re-register any legacy approved-config record), or use
+a new local state database after review.
 
 ## Dry-run and publish
 
@@ -124,27 +125,41 @@ one computer only. They are not a distributed lock or a service scheduler.
 
 ## Failure recovery
 
-The worker persists each external side effect. Rerunning can reconcile a
-`committed` or `pushed` claim instead of creating a second branch or PR. A
-verification or Codex failure is safe to inspect and retry after fixing the
-cause.
+The worker persists each external side effect. Keep the same `PATCHPOOL_DB` and
+the same worker identity (`PATCHPOOL_WORKER_ID`, when set) when retrying. A
+dry-run that reached `verified`, or a normal crash before completion, resumes by
+rerunning the same command with the same issue:
+
+```text
+node bin/patchpool.js run --repo K-saint25/PatchPool --issue <issue-number>
+```
+
+For the guarded self-dogfood path, rerun the same `e2e --repo
+K-saint25/PatchPool --issue <issue-number> --publish` command. A verification or
+Codex failure is safe to inspect and retry after fixing the cause. A dead owner
+can be recovered after its execution lease expires, then the same command can
+be rerun.
 
 A dry-run intentionally leaves its `verified` claim active as a fail-safe. For
 manual recovery:
 
-1. Stop the worker and all child processes. If termination cannot be confirmed,
-   leave the run pending and investigate before starting another worker. On
-   Windows, `taskkill` is PID-based and has a small PID-reuse residual.
-2. Resolve the state path from `PATCHPOOL_DB`, or use `.patchpool.sqlite` in the
-   current directory. Close all workers, then make a filesystem backup of the
-   database and any adjacent `-wal`/`-shm` files before inspecting it.
-3. Use the supported state-recovery tooling or a maintainer-reviewed procedure
-   to reconcile the claim. Do not delete claim rows or leases just to unblock a
-   retry. An expired legacy lease without owner PID/session metadata requires
-   manual state recovery and is never automatically reclaimed.
-4. If a branch was already pushed, verify the branch and Draft PR on GitHub
-   before retrying; rerun so the workflow can reconcile the recorded remote
-   side effect rather than creating a duplicate.
+1. Stop the worker and its entire process tree. If termination cannot be
+   confirmed, wait until the process tree is confirmed stopped; do not start
+   another worker. On Windows, `taskkill` is PID-based and has a small PID-reuse
+   residual, so unconfirmed termination remains pending.
+2. For a `pushed` or ambiguous result, inspect the GitHub branch and Draft PR
+   first. Then rerun the same command so the workflow reconciles the recorded
+   remote side effect instead of creating a duplicate.
+3. For an expired owner lease, confirm the owner process is dead, keep the same
+   `PATCHPOOL_DB` and worker identity, and rerun after lease expiry. Never
+   overwrite a live lease.
+4. For a legacy ownerless lease, stop every worker, resolve `PATCHPOOL_DB`, and
+   back up the database plus adjacent `-wal`/`-shm` files. Only when you can
+   prove the run was never published and has no remote side effect may you
+   move that state database aside, choose a new state path, and re-register
+   with `repo add --config .patchpool.json`. If there is any uncertainty or a
+   branch/PR may exist, do not edit or delete the database; contact a
+   maintainer for recovery.
 
 ## Security and AI disclosure
 
