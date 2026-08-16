@@ -1,6 +1,6 @@
 import { PatchPoolError } from './errors.js';
 import { join } from 'node:path';
-import { PatchPoolStore } from './store.js';
+import { PatchPoolStore, requireCanonicalFullName } from './store.js';
 import { CommandRunner } from './runner.js';
 import { GitHubClient } from './github.js';
 import { CodexClient } from './codex.js';
@@ -80,6 +80,96 @@ function assertClaimListArguments(argv) {
   const { positional, options } = parsed;
   const unsupported = positional.length > 0 || !options.json || Object.keys(options).some(key => key !== 'json');
   if (unsupported) throw new PatchPoolError('INVALID_ARGS', 'claim list requires --json and accepts no other arguments');
+}
+
+function assertSupportedOptions(options, allowed, label) {
+  const unsupported = Object.keys(options).find(key => !allowed.has(key));
+  if (unsupported) {
+    throw new PatchPoolError('INVALID_ARGS', `${label} does not accept --${unsupported.replaceAll('_', '-')}`);
+  }
+}
+
+function assertNoPositionals(positional, label) {
+  if (positional.length > 0) throw new PatchPoolError('INVALID_ARGS', `${label} does not accept positional arguments`);
+}
+
+function assertInvocation(argv) {
+  const [command, maybeSubcommand, ...remaining] = argv;
+  if (!command) throw new PatchPoolError('INVALID_ARGS', 'A command is required');
+
+  if (command === 'doctor') {
+    const { positional, options } = parseArguments(argv.slice(1));
+    assertNoPositionals(positional, 'doctor');
+    assertSupportedOptions(options, new Set(['json']), 'doctor');
+    return command;
+  }
+
+  if (command === 'repo') {
+    const subcommand = maybeSubcommand;
+    if (subcommand !== 'add' && subcommand !== 'list') {
+      throw new PatchPoolError('INVALID_ARGS', `Unknown command: ${[command, subcommand].filter(Boolean).join(' ')}`);
+    }
+    const { positional, options } = parseArguments(remaining);
+    if (subcommand === 'list') {
+      assertNoPositionals(positional, 'repo list');
+      assertSupportedOptions(options, new Set(['json']), 'repo list');
+      return command;
+    }
+    if (positional.length > 1 || (positional.length === 1 && options.repo !== undefined)) {
+      throw new PatchPoolError('INVALID_ARGS', 'repo add accepts one repository owner/name');
+    }
+    assertSupportedOptions(options, new Set([
+      'repo', 'config', 'inactive', 'public', 'blocking_label', 'blocking_labels',
+      'config_digest', 'verification_argv', 'verify_argv',
+    ]), 'repo add');
+    if (options.config_digest !== undefined || options.verification_argv !== undefined || options.verify_argv !== undefined) {
+      throw new PatchPoolError('INVALID_ARGS', 'Repository approval must come from .patchpool.json; caller-provided digest and verification argv are not accepted');
+    }
+    const fullName = required({ fullName: options.repo ?? positional[0] }, 'fullName', 'repository owner/name');
+    requireCanonicalFullName(fullName);
+    return command;
+  }
+
+  if (command === 'claim' && maybeSubcommand === 'list') {
+    assertClaimListArguments(argv);
+    return command;
+  }
+
+  if (command === 'claim') {
+    const { positional, options } = parseArguments(argv.slice(1));
+    assertNoPositionals(positional, 'claim');
+    assertSupportedOptions(options, new Set(['repo', 'issue', 'worker']), 'claim');
+    requireCanonicalFullName(required(options, 'repo', '--repo'));
+    const issueText = required(options, 'issue', '--issue');
+    required(options, 'worker', '--worker');
+    const issueNumber = Number(issueText);
+    if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+      throw new PatchPoolError('INVALID_ARGS', '--issue must be a positive integer');
+    }
+    return command;
+  }
+
+  if (command === 'run' || command === 'e2e') {
+    const { positional, options } = parseArguments(argv.slice(1));
+    assertNoPositionals(positional, command);
+    assertSupportedOptions(options, new Set(['repo', 'issue', 'publish', 'keep_workspace']), command);
+    const fullName = requireCanonicalFullName(required(options, 'repo', '--repo'));
+    if (options.issue !== undefined) {
+      const issueNumber = Number(options.issue);
+      if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+        throw new PatchPoolError('INVALID_ARGS', '--issue must be a positive integer');
+      }
+    }
+    if (command === 'e2e' && fullName !== 'K-saint25/PatchPool') {
+      throw new PatchPoolError('E2E_REPOSITORY_GUARD', 'Manual E2E is restricted to K-saint25/PatchPool');
+    }
+    if (command === 'e2e' && options.publish !== true) {
+      throw new PatchPoolError('E2E_PUBLISH_REQUIRED', 'Manual E2E requires explicit --publish');
+    }
+    return command;
+  }
+
+  throw new PatchPoolError('INVALID_ARGS', `Unknown command: ${[command, maybeSubcommand].filter(Boolean).join(' ')}`);
 }
 
 async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env, codexModel, cwd = process.cwd(), dbPath, nodeVersion }) {
@@ -188,16 +278,21 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     stdout(HELP);
     return { command: 'help', exitCode: 0 };
   }
-  if (argv[0] === 'claim' && argv[1] === 'list') {
-    assertClaimListArguments(argv);
-    const dbPath = options.dbPath ?? process.env.PATCHPOOL_DB ?? '.patchpool.sqlite';
+  const command = assertInvocation(argv);
+  const requestedDbPath = options.dbPath ?? process.env.PATCHPOOL_DB;
+  const dbPath = requestedDbPath ?? '.patchpool.sqlite';
+  if (command === 'claim' && argv[1] === 'list') {
     const claims = options.store ? options.store.listClaims() : PatchPoolStore.listClaimsReadOnly(dbPath);
     emit(stdout, claims);
     return claims;
   }
+  if (command === 'repo' && argv[1] === 'list') {
+    const repositories = options.store ? options.store.listRepositories() : PatchPoolStore.listRepositoriesReadOnly(dbPath);
+    emit(stdout, repositories);
+    return repositories;
+  }
   const environment = options.environment ?? process.env;
-  const codexModel = resolveCodexModel(environment);
-  const requestedDbPath = options.dbPath ?? process.env.PATCHPOOL_DB;
+  const codexModel = command === 'run' || command === 'e2e' ? resolveCodexModel(environment) : undefined;
   const common = {
     stdout,
     workflow: options.workflow,
@@ -208,15 +303,15 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     environment,
     codexModel,
     cwd: options.cwd ?? process.cwd(),
-    dbPath: requestedDbPath ?? '.patchpool.sqlite',
+    dbPath,
     nodeVersion: options.nodeVersion ?? process.versions.node,
   };
   if (argv[0] === 'doctor') return dispatch(argv, { ...common, store: undefined });
   const ownsStore = !options.store;
-  const store = options.store ?? PatchPoolStore.open(requestedDbPath ?? '.patchpool.sqlite');
-  const dbPath = requestedDbPath ?? store.path ?? '.patchpool.sqlite';
+  const store = options.store ?? PatchPoolStore.open(dbPath);
+  const openedDbPath = requestedDbPath ?? store.path ?? '.patchpool.sqlite';
   try {
-    return await dispatch(argv, { ...common, store, dbPath });
+    return await dispatch(argv, { ...common, store, dbPath: openedDbPath });
   } finally {
     if (ownsStore) store.close();
   }

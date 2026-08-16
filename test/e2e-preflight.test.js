@@ -252,10 +252,14 @@ test('doctor CLI emits aggregated JSON and exits nonzero for an invalid state pa
   }
 });
 
-test('--help prints usage without opening the state database', async () => {
+test('--help prints usage without opening the state database or validating a model', async () => {
   const output = [];
   const impossiblePath = join(tmpdir(), 'patchpool-help-must-not-open', 'state.sqlite');
-  const result = await main(['--help'], { dbPath: impossiblePath, stdout: value => output.push(value) });
+  const result = await main(['--help'], {
+    dbPath: impossiblePath,
+    environment: { PATCHPOOL_CODEX_MODEL: 'invalid/model' },
+    stdout: value => output.push(value),
+  });
   assert.equal(result.command, 'help');
   assert.match(output.join(''), /patchpool doctor \[--json\]/);
   assert.match(output.join(''), /patchpool repo add/);
