@@ -164,12 +164,19 @@ node bin/patchpool.js claim list --json
 ```
 
 Use the matching claim's `state`, `workspace`, `branch`, `commitSha`, `prUrl`,
-and `errorCode` to decide whether to inspect or retry it. Then rerun the same
-command with the same issue:
+and `errorCode` to decide whether to inspect or retry it. Then rerun with the
+same worker identity and an explicit matching issue number:
 
 ```text
 node bin/patchpool.js run --repo K-saint25/PatchPool --issue <issue-number>
 ```
+
+For an active `pushed` or `pr_opened` claim, this exact command does not need a
+new `--publish` flag and does not re-evaluate issue eligibility. It only
+reconciles the recorded branch with an existing or new Draft PR after the
+approved repository, approval generation, worker identity, lease, branch, and
+commit metadata have been revalidated. New claims still require the normal
+issue eligibility checks and an explicit `--publish` before any remote write.
 
 For the guarded self-dogfood path, rerun the same `e2e --repo
 K-saint25/PatchPool --issue <issue-number> --publish` command. A verification or

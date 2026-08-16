@@ -489,6 +489,7 @@ export class PatchPoolStore {
     const issueNumber = Number(input?.issueNumber);
     const workerId = String(input?.workerId ?? '').trim();
     const expectedConfigDigest = String(input?.expectedConfigDigest ?? '').trim();
+    const existingOnly = input?.existingOnly === true;
     if (!Number.isInteger(repoId) || repoId < 1 || !Number.isInteger(issueNumber) || issueNumber < 1 || !workerId || !expectedConfigDigest) {
       throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, workerId, and expectedConfigDigest are required');
     }
@@ -509,6 +510,7 @@ export class PatchPoolStore {
         if (mapped.workerId === workerId) return mapped;
         throw new PatchPoolError('CLAIM_EXISTS', `Issue ${issueNumber} already has an active claim`);
       }
+      if (existingOnly) return null;
       const timestamp = now();
       const fields = { ...(input.fields ?? {}), approvalConfigDigest: expectedConfigDigest };
       try {

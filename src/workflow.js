@@ -108,6 +108,7 @@ function remoteUrls(stdout) {
 function validatePullRequest(pr, repository, base, branch, issueNumberValue) {
   if (!pr || typeof pr !== 'object') throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Reconciled pull request response is invalid');
   if (pr.isDraft !== true) throw new PatchPoolError('WORKFLOW_PR_NOT_DRAFT', 'Pull request is not Draft');
+  if (pr.state !== 'OPEN') throw new PatchPoolError('WORKFLOW_PR_NOT_OPEN', 'Pull request is not open');
   if (pr.headRefName !== branch) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request head does not match the worker branch');
   const baseRef = pr.baseRefName ?? pr.baseBranch ?? pr.base?.ref;
   if (baseRef !== base) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request base does not match the repository default branch');
@@ -118,6 +119,17 @@ function validatePullRequest(pr, repository, base, branch, issueNumberValue) {
   if (typeof pr.url !== 'string' || !new RegExp(`^https://github\\.com/${escapeRegex(repository)}/pull/\\d+$`).test(pr.url)) throw new PatchPoolError('WORKFLOW_PR_MISMATCH', 'Pull request URL is invalid or belongs to another repository');
   if (typeof pr.body !== 'string' || !/AI-assisted implementation/i.test(pr.body) || !new RegExp(`Closes #${issueNumberValue}\\b`).test(pr.body)) throw new PatchPoolError('WORKFLOW_PR_DISCLOSURE_MISSING', 'Pull request body must contain the AI disclosure and Issue link');
   return pr;
+}
+
+function validatePublishedClaimMetadata(claim, repository, number) {
+  const expectedBranch = `patchpool/issue-${number}-${claim.id}`;
+  if (claim.branch !== expectedBranch || typeof claim.commitSha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(claim.commitSha)) {
+    throw new PatchPoolError('WORKFLOW_RECOVERY_METADATA_INVALID', 'Published claim branch or commit metadata is invalid');
+  }
+  if (claim.state === 'pr_opened' && (typeof claim.prUrl !== 'string' || !new RegExp(`^https://github\\.com/${escapeRegex(repository)}/pull/\\d+$`).test(claim.prUrl))) {
+    throw new PatchPoolError('WORKFLOW_RECOVERY_METADATA_INVALID', 'Published claim pull request metadata is invalid');
+  }
+  return { branch: claim.branch, commitSha: claim.commitSha };
 }
 
 export class IssueWorkflow {
@@ -411,6 +423,7 @@ export class IssueWorkflow {
 
   async run({ repo, issueNumber: requestedIssueNumber, publish = false, keepWorkspace = false } = {}) {
     const fullName = repositoryName(repo);
+    const explicitIssueNumber = requestedIssueNumber === undefined ? undefined : issueNumber(null, requestedIssueNumber);
     const approved = this.store.getRepository(fullName);
     if (!approved) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${fullName}`);
     if (!approved.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${fullName}`);
@@ -425,8 +438,52 @@ export class IssueWorkflow {
     let branch;
     let leaseController;
     try {
+      let publishedRecovery = false;
+      if (explicitIssueNumber !== undefined) {
+        const publishedClaim = this.store.claimIssue({
+          repoId: approved.id,
+          issueNumber: explicitIssueNumber,
+          workerId: this.workerId,
+          expectedConfigDigest: approved.configDigest,
+          existingOnly: true,
+        });
+        if (publishedClaim?.state === 'pushed' || publishedClaim?.state === 'pr_opened') {
+          claim = publishedClaim;
+          if (typeof this.store.acquireExecutionLease === 'function') {
+            const lease = this.store.acquireExecutionLease(claim.id, this.workerId, {
+              ttlMs: this.leaseTtlMs,
+              ownerPid: this.leaseOwnerPid,
+              ownerSessionId: this.leaseOwnerSessionId,
+            });
+            leaseController = this.startLeaseHeartbeat(lease);
+            this.assertLease(leaseController);
+          }
+          ({ branch, commitSha } = validatePublishedClaimMetadata(claim, fullName, explicitIssueNumber));
+          publishedRecovery = true;
+        }
+      }
+
       const canonical = await this.github.getRepository(fullName);
       if (canonical?.fullName !== fullName || canonical?.public === false || canonical?.isPrivate === true || canonical?.archived === true || canonical?.isArchived === true || ['private', 'internal'].includes(String(canonical?.visibility ?? '').toLowerCase())) throw new PatchPoolError('WORKFLOW_REPOSITORY_INELIGIBLE', `Repository is not eligible: ${fullName}`);
+
+      if (publishedRecovery) {
+        const remoteCommitSha = await this.withLease(leaseController, signal => this.github.getBranchHeadSha(fullName, branch, { signal, timeoutMs: this.externalOperationTimeoutMs }));
+        if (remoteCommitSha !== commitSha) throw new PatchPoolError('WORKFLOW_RECOVERY_REF_MISMATCH', 'Remote worker branch head does not match the recorded published commit');
+        const base = canonical.defaultBranch ?? 'main';
+        if (claim.state === 'pr_opened') {
+          try {
+            pr = await this.withLease(leaseController, signal => this.openPullRequest({ fullName, base, branch, number: explicitIssueNumber, publish: false, signal, timeoutMs: this.externalOperationTimeoutMs }));
+            if (pr.url !== claim.prUrl) throw new PatchPoolError('WORKFLOW_RECOVERY_PR_INVALID', 'Remote Draft pull request does not match the recorded pull request');
+          } catch (cause) {
+            if (cause?.code === 'LEASE_LOST') throw cause;
+            throw new PatchPoolError('WORKFLOW_RECOVERY_PR_INVALID', 'Recorded Draft pull request could not be revalidated');
+          }
+          return { state: claim.state, claimId: claim.id, issueNumber: explicitIssueNumber, branch, commitSha, prUrl: claim.prUrl, workspace: keepWorkspace ? claim.workspace : undefined };
+        }
+        pr = await this.withLease(leaseController, signal => this.openPullRequest({ fullName, base, branch, number: explicitIssueNumber, publish: true, signal, timeoutMs: this.externalOperationTimeoutMs }));
+        claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() }, leaseController);
+        return { state: claim.state, claimId: claim.id, issueNumber: explicitIssueNumber, branch, commitSha, prUrl: pr.url, workspace: keepWorkspace ? claim.workspace : undefined };
+      }
 
       let issue;
       if (requestedIssueNumber !== undefined) {

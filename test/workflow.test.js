@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { digestApprovedRepositoryConfig } from '../src/config.js';
+import { PatchPoolError } from '../src/errors.js';
 
 test('workflow module is present', async () => {
   const module = await import('../src/workflow.js');
@@ -36,8 +37,9 @@ function setup({ verificationExitCode = 0, storePath = ':memory:' } = {}) {
     async listIssues() { return []; },
     async clone(name, directory) { calls.push(['clone', directory]); },
     async getPushRemote() { calls.push(['permission']); return { canPush: true, remoteName: 'origin' }; },
+    async getBranchHeadSha(name, branch) { calls.push(['branch-ref', branch]); return 'a'.repeat(40); },
     async findPullRequest() { calls.push(['find-pr']); return null; },
-    async createDraftPullRequest(input) { calls.push(['create-pr']); return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body }; },
+    async createDraftPullRequest(input) { calls.push(['create-pr']); return { url: 'https://github.com/octo/example/pull/1', isDraft: true, state: 'OPEN', headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body }; },
   };
   const runner = {
     async run(command, args, options) {
@@ -217,7 +219,7 @@ test('publish disables hooks, refreshes issue before push, and creates one Draft
   setupState.github.createDraftPullRequest = async input => {
     created = input;
     setupState.calls.push(['create-pr']);
-    return { url: 'https://github.com/octo/example/pull/1', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body };
+    return { url: 'https://github.com/octo/example/pull/1', isDraft: true, state: 'OPEN', headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: input.body };
   };
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
@@ -244,7 +246,7 @@ test('ambiguous PR creation reconciles the existing matching Draft PR without re
   let creates = 0;
   setupState.github.findPullRequest = async () => {
     lookups += 1;
-    return lookups === 1 ? null : { url: 'https://github.com/octo/example/pull/9', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' };
+    return lookups === 1 ? null : { url: 'https://github.com/octo/example/pull/9', isDraft: true, state: 'OPEN', headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' };
   };
   setupState.github.createDraftPullRequest = async () => {
     creates += 1;
@@ -273,6 +275,7 @@ test('PR lookup and cleanup failures after a successful push preserve pushed sta
     return {
       url: 'https://github.com/octo/example/pull/9',
       isDraft: true,
+      state: 'OPEN',
       headRefName: 'patchpool/issue-1-1',
       baseRefName: 'main',
       baseRepository: { fullName: 'octo/example' },
@@ -282,7 +285,7 @@ test('PR lookup and cleanup failures after a successful push preserve pushed sta
   };
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
-    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '' };
     return originalRun(command, args, options);
   };
   const { IssueWorkflow } = await import('../src/workflow.js');
@@ -317,6 +320,7 @@ test('rejects a pull-request-shaped issue before cloning or claiming', async () 
   const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_PULL_REQUEST');
   assert.equal(setupState.store.listRepositories().length, 1);
+  assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
   assert.equal(setupState.calls.some(call => call[0] === 'clone'), false);
   setupState.store.close();
 });
@@ -373,20 +377,202 @@ test('rejects a rename record whose destination is a secret path', async () => {
   setupState.store.close();
 });
 
-test('resumes a pushed claim by reconciling its PR without running Codex or pushing again', async () => {
+test('resumes a pushed claim with an existing Draft PR without publish or issue eligibility checks', async () => {
   const setupState = setup();
   const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1' });
   setupState.store.transitionClaim(claim.id, 'verified');
-  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc' });
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
   setupState.store.transitionClaim(claim.id, 'pushed');
-  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
+  setupState.github.getIssue = async () => { throw new Error('pushed recovery must not recheck issue eligibility'); };
+  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, state: 'OPEN', headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
+  let leaseAcquisitions = 0;
+  const acquireExecutionLease = setupState.store.acquireExecutionLease.bind(setupState.store);
+  setupState.store.acquireExecutionLease = (...args) => { leaseAcquisitions += 1; return acquireExecutionLease(...args); };
   const { IssueWorkflow } = await import('../src/workflow.js');
   const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
-  const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true });
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
   assert.equal(result.state, 'pr_opened');
+  assert.equal(leaseAcquisitions, 1);
   assert.equal(setupState.calls.some(call => call[0] === 'codex'), false);
   assert.equal(setupState.calls.some(call => call[0] === 'run' && call[2]?.[0] === 'push'), false);
+  setupState.store.close();
+});
+
+test('resumes a pushed claim by creating the missing Draft PR without publish', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 7, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+  const branch = `patchpool/issue-7-${claim.id}`;
+  setupState.store.transitionClaim(claim.id, 'running', { branch });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+  setupState.store.transitionClaim(claim.id, 'pushed');
+  setupState.github.getIssue = async () => { throw new Error('pushed recovery must not recheck issue eligibility'); };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 7, publish: false });
+
+  assert.equal(result.state, 'pr_opened');
+  assert.equal(setupState.calls.filter(call => call[0] === 'create-pr').length, 1);
+  assert.equal(setupState.calls.some(call => call[0] === 'issue'), false);
+  assert.equal(setupState.calls.some(call => call[0] === 'codex'), false);
+  assert.equal(setupState.calls.some(call => call[0] === 'run' && call[2]?.includes('push')), false);
+  setupState.store.close();
+});
+
+test('resumes a pr_opened claim without publish or issue eligibility checks', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 3, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+  const branch = `patchpool/issue-3-${claim.id}`;
+  setupState.store.transitionClaim(claim.id, 'running', { branch });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+  setupState.store.transitionClaim(claim.id, 'pushed');
+  setupState.store.transitionClaim(claim.id, 'pr_opened', { prUrl: 'https://github.com/octo/example/pull/3' });
+  setupState.github.getIssue = async () => { throw new Error('pr_opened recovery must not recheck issue eligibility'); };
+  setupState.github.findPullRequest = async () => {
+    setupState.calls.push(['find-pr']);
+    return { url: 'https://github.com/octo/example/pull/3', isDraft: true, state: 'OPEN', headRefName: branch, baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #3' };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 3, publish: false });
+
+  assert.equal(result.state, 'pr_opened');
+  assert.equal(result.prUrl, 'https://github.com/octo/example/pull/3');
+  assert.equal(setupState.calls.some(call => call[0] === 'issue'), false);
+  assert.equal(setupState.calls.filter(call => call[0] === 'find-pr').length, 1);
+  setupState.store.close();
+});
+
+test('published recovery verifies the exact remote branch head before PR reconciliation', async () => {
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  for (const mode of ['force-pushed', 'lookup-failed']) {
+    const setupState = setup();
+    const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 4, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+    const branch = `patchpool/issue-4-${claim.id}`;
+    setupState.store.transitionClaim(claim.id, 'running', { branch });
+    setupState.store.transitionClaim(claim.id, 'verified');
+    setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+    setupState.store.transitionClaim(claim.id, 'pushed');
+    setupState.github.getBranchHeadSha = async (name, requestedBranch) => {
+      setupState.calls.push(['branch-ref', requestedBranch]);
+      if (mode === 'lookup-failed') throw new PatchPoolError('GITHUB_COMMAND_FAILED', 'Branch ref lookup failed');
+      return 'f'.repeat(40);
+    };
+    const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 4, publish: false }),
+      error => error.code === (mode === 'force-pushed' ? 'WORKFLOW_RECOVERY_REF_MISMATCH' : 'GITHUB_COMMAND_FAILED'),
+    );
+    assert.deepEqual(setupState.calls, [['repo', 'octo/example'], ['branch-ref', branch]]);
+    assert.equal(setupState.store.getClaim(claim.id).state, 'pushed');
+    setupState.store.close();
+  }
+});
+
+test('pr_opened recovery rejects a missing or mismatched remote Draft PR without changing state', async () => {
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  for (const remote of [
+    null,
+    { url: 'https://github.com/octo/example/pull/99', isDraft: true, state: 'OPEN', headRefName: 'patchpool/issue-6-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #6' },
+    { url: 'https://github.com/octo/example/pull/6', isDraft: false, state: 'OPEN', headRefName: 'patchpool/issue-6-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #6' },
+    { url: 'https://github.com/octo/example/pull/6', isDraft: true, state: 'CLOSED', headRefName: 'patchpool/issue-6-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #6' },
+  ]) {
+    const setupState = setup();
+    const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 6, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+    const branch = `patchpool/issue-6-${claim.id}`;
+    setupState.store.transitionClaim(claim.id, 'running', { branch });
+    setupState.store.transitionClaim(claim.id, 'verified');
+    setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+    setupState.store.transitionClaim(claim.id, 'pushed');
+    setupState.store.transitionClaim(claim.id, 'pr_opened', { prUrl: 'https://github.com/octo/example/pull/6' });
+    setupState.github.findPullRequest = async () => { setupState.calls.push(['find-pr']); return remote; };
+    const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 6, publish: false }),
+      error => error.code === 'WORKFLOW_RECOVERY_PR_INVALID',
+    );
+    assert.deepEqual(setupState.calls, [['repo', 'octo/example'], ['branch-ref', branch], ['find-pr']]);
+    assert.equal(setupState.store.getClaim(claim.id).state, 'pr_opened');
+    setupState.store.close();
+  }
+});
+
+test('published recovery rejects malformed branch and commit metadata before PR calls', async () => {
+  const cases = [
+    { branch: 'unexpected-branch', commitSha: 'd'.repeat(40) },
+    { branch: 'patchpool/issue-5-1', commitSha: 'not-a-commit' },
+  ];
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  for (const value of cases) {
+    const setupState = setup();
+    const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 5, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+    setupState.store.transitionClaim(claim.id, 'running', { branch: value.branch });
+    setupState.store.transitionClaim(claim.id, 'verified');
+    setupState.store.transitionClaim(claim.id, 'committed', { commitSha: value.commitSha });
+    setupState.store.transitionClaim(claim.id, 'pushed');
+    const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 5, publish: false }),
+      error => error.code === 'WORKFLOW_RECOVERY_METADATA_INVALID',
+    );
+    assert.deepEqual(setupState.calls, []);
+    assert.equal(setupState.store.getClaim(claim.id).state, 'pushed');
+    setupState.store.close();
+  }
+});
+
+test('published recovery rejects another worker and approval generation before issue or PR calls', async () => {
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  for (const mode of ['worker', 'approval']) {
+    const setupState = setup();
+    const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 9, workerId: mode === 'worker' ? 'worker-b' : 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+    const branch = `patchpool/issue-9-${claim.id}`;
+    setupState.store.transitionClaim(claim.id, 'running', { branch });
+    setupState.store.transitionClaim(claim.id, 'verified');
+    setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+    setupState.store.transitionClaim(claim.id, 'pushed');
+    if (mode === 'approval') {
+      const nextConfig = { ...APPROVED_CONFIG, timeoutMinutes: 31 };
+      setupState.store.db.prepare('UPDATE repositories SET config_digest = ?, policy_json = ? WHERE id = ?')
+        .run(digestApprovedRepositoryConfig(nextConfig), JSON.stringify({ approvedConfig: nextConfig }), setupState.repository.id);
+    }
+    const approvedTimeoutMs = mode === 'approval' ? 31 * 60 * 1_000 : APPROVED_TIMEOUT_MS;
+    const workflow = new IssueWorkflow({ ...setupState, approvedTimeoutMs, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 9, publish: false }),
+      error => error.code === (mode === 'worker' ? 'CLAIM_EXISTS' : 'REPOSITORY_APPROVAL_CHANGED'),
+    );
+    assert.deepEqual(setupState.calls, []);
+    setupState.store.close();
+  }
+});
+
+test('published recovery rejects a busy execution lease before external calls', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 8, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
+  const branch = `patchpool/issue-8-${claim.id}`;
+  setupState.store.transitionClaim(claim.id, 'running', { branch });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'a'.repeat(40) });
+  setupState.store.transitionClaim(claim.id, 'pushed');
+  setupState.store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000, ownerPid: process.pid, ownerSessionId: 'existing-session' });
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'unused', cleanup: async () => {} });
+
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 8, publish: false }),
+    error => error.code === 'LEASE_BUSY',
+  );
+  assert.deepEqual(setupState.calls, []);
+  assert.equal(setupState.store.getClaim(claim.id).state, 'pushed');
   setupState.store.close();
 });
 
@@ -463,7 +649,7 @@ test('committed resume reuses a matching workspace without cloning', async () =>
     if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
     return { exitCode: 0, stdout: '', stderr: '' };
   };
-  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
+  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, state: 'OPEN', headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
   const { IssueWorkflow } = await import('../src/workflow.js');
   const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', filesystem: { lstat: async () => ({ isDirectory: () => true }), realpath: async path => path, readdir: async () => [], readFile: async () => Buffer.from('') }, tempDirectoryFactory: async () => 'new-worktree', cleanup: async () => {} });
   const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true });
@@ -495,7 +681,7 @@ test('committed resume with an unusable workspace restarts from running in a fre
 
 test('does not synthesize a missing remote PR body from the local request', async () => {
   const setupState = setup();
-  setupState.github.createDraftPullRequest = async input => ({ url: 'https://github.com/octo/example/pull/4', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' } });
+  setupState.github.createDraftPullRequest = async input => ({ url: 'https://github.com/octo/example/pull/4', isDraft: true, state: 'OPEN', headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' } });
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
     if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
