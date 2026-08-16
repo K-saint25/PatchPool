@@ -42,7 +42,7 @@ test('getRepository requests JSON and accepts only canonical public non-archived
 });
 
 test('getRepository rejects malformed JSON and non-canonical/private/internal/archived repositories', async () => {
-  for (const stdout of ['not-json', 'null', '[]', JSON.stringify({ nameWithOwner: 'octo/other', isPrivate: false, isArchived: false, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: true, isArchived: false, visibility: 'PRIVATE' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: true, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: false, visibility: 'INTERNAL' })]) {
+  for (const stdout of ['not-json', 'null', '[]', JSON.stringify({ nameWithOwner: 'octo/other', isPrivate: false, isArchived: false, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: true, isArchived: false, visibility: 'PRIVATE' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: true, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: false, visibility: 'INTERNAL' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: false, visibility: 'INTERNAL', isPublic: true }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: false, visibility: 'PUBLIC', isPublic: false })]) {
     const runner = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
     const client = new GitHubClient({ runner });
     await assert.rejects(() => client.getRepository('octo/example'), error => error.code === 'GITHUB_INVALID_JSON' || error.code === 'GITHUB_REPOSITORY_INELIGIBLE');
@@ -109,4 +109,19 @@ test('createDraftPullRequest rejects a URL for a different repository before rec
   const client = new GitHubClient({ runner });
   await assert.rejects(() => client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' }), error => error.code === 'GITHUB_INVALID_PR_URL');
   assert.equal(runner.calls.length, 1);
+});
+
+test('createDraftPullRequest rejects credentials, explicit ports, queries, and hashes in PR URLs', async () => {
+  for (const url of [
+    'https://user:pass@github.com/octo/example/pull/2',
+    'https://github.com:443/octo/example/pull/2',
+    'https://github.com:444/octo/example/pull/2',
+    'https://github.com/octo/example/pull/2?x=1',
+    'https://github.com/octo/example/pull/2#fragment',
+  ]) {
+    const runner = scriptedRunner([{ exitCode: 0, stdout: `${url}\n`, stderr: '' }]);
+    const client = new GitHubClient({ runner });
+    await assert.rejects(() => client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' }), error => error.code === 'GITHUB_INVALID_PR_URL');
+    assert.equal(runner.calls.length, 1);
+  }
 });

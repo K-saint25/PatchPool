@@ -47,7 +47,7 @@ function requirePullRequestUrl(value, canonical, code = 'GITHUB_INVALID_PR_URL')
   let parsed;
   try { parsed = new URL(value); } catch { throw new PatchPoolError(code, 'GitHub pull request URL is invalid'); }
   const prefix = `/${canonical}/pull/`;
-  if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' || parsed.search || parsed.hash || !parsed.pathname.startsWith(prefix) || !/^\d+$/.test(parsed.pathname.slice(prefix.length))) {
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash || parsed.href !== value || !parsed.pathname.startsWith(prefix) || !/^\d+$/.test(parsed.pathname.slice(prefix.length))) {
     throw new PatchPoolError(code, 'GitHub pull request URL does not match the requested repository');
   }
   return parsed.href;
@@ -90,7 +90,7 @@ export class GitHubClient {
     const isPrivate = value.isPrivate ?? value.private;
     const isArchived = value.isArchived ?? value.archived;
     const visibility = String(value.visibility ?? '').toLowerCase();
-    const isPublic = value.isPublic === true || value.public === true || visibility === 'public';
+    const isPublic = visibility === 'public' && (value.isPublic === undefined || value.isPublic === true) && (value.public === undefined || value.public === true);
     if (returnedName !== canonical || isPrivate !== false || isArchived !== false || !isPublic) {
       throw new PatchPoolError('GITHUB_REPOSITORY_INELIGIBLE', `Repository is not canonical, public, and active: ${canonical}`);
     }

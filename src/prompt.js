@@ -3,7 +3,9 @@ import { PatchPoolError } from './errors.js';
 const FULL_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 function text(value) {
-  return String(value ?? '').replaceAll('</untrusted-issue>', '<\\/untrusted-issue>');
+  return String(value ?? '')
+    .replace(/<\/untrusted-data>/gi, match => `<\\/${match.slice(2)}`)
+    .replace(/<\/untrusted-issue>/gi, match => `<\\/${match.slice(2)}`);
 }
 
 /**

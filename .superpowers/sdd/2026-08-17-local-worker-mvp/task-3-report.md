@@ -71,3 +71,25 @@ The focused command was `npm test -- test/github.test.js test/codex.test.js test
 - `buildImplementationPrompt` validates canonical `owner/name` and places repository metadata inside the same `<untrusted-data>` boundary as issue content; trusted policy text contains no interpolated repository data.
 - PR URLs are HTTPS `github.com` URLs with the exact requested owner/repository and numeric `/pull/<number>` path.
 - The focused Codex argv test continues to assert the installed CLI contract: safety globals precede `exec`, `--cd` scopes the worktree, and ignore flags remain intentional.
+
+## Fix round 2
+
+### RED evidence
+
+Added focused regressions before implementation changes:
+
+- `test/github.test.js` failed for `visibility: "INTERNAL"` paired with `isPublic: true`, proving boolean flags could override the visibility field. It also failed to reject credentials, explicit default/non-default ports, query strings, and fragments in PR URLs.
+- `test/prompt.test.js` failed because mixed-case `</untrusted-data>` markers in title, body, and labels were emitted as live outer delimiters.
+
+The RED command was `npm test -- test/github.test.js test/prompt.test.js`; it produced the expected two behavior failures.
+
+### GREEN evidence
+
+- `npm test -- test/github.test.js test/prompt.test.js` — 13 passed, 0 failed.
+- `npm test` — 42 passed, 0 failed.
+
+### Fixes and self-review
+
+- Repository acceptance now requires a present normalized `visibility === "public"`; any inconsistent `public`/`isPublic` flag fails closed.
+- PR URL validation now requires the exact canonical `https://github.com/<owner>/<repo>/pull/<number>` string, rejecting credentials, explicit ports (including `:443`), query strings, fragments, and other URL normalization.
+- Every untrusted prompt field escapes outer and inner closing markers case-insensitively while preserving the original case; only the final structural outer closing tag remains live.
