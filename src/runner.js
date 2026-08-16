@@ -64,6 +64,7 @@ export class CommandRunner {
     const maxOutputBytes = options.maxOutputBytes ?? options.maxCaptureBytes ?? this.maxOutputBytes;
     const spawnOptions = spawnOptionsFrom(options);
     const redact = createRedactor([...this.sensitiveValues, ...(options.sensitiveValues ?? [])]);
+    const abortSignal = options.signal;
 
     return new Promise((resolve, reject) => {
       const stdoutChunks = [];
@@ -74,6 +75,7 @@ export class CommandRunner {
       let timer;
       let settled = false;
       let timedOut = false;
+      let abortHandler;
 
       const output = () => ({
         stdout: redact(Buffer.concat(stdoutChunks).toString('utf8')),
@@ -84,8 +86,14 @@ export class CommandRunner {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        if (abortHandler && abortSignal) abortSignal.removeEventListener('abort', abortHandler);
         fn(value);
       };
+
+      if (abortSignal?.aborted) {
+        finish(reject, new PatchPoolError('COMMAND_ABORTED', `Command was aborted: ${redact(command)}`));
+        return;
+      }
 
       try {
         child = this.spawnFn(command, args, spawnOptions);
@@ -110,6 +118,16 @@ export class CommandRunner {
         if (timedOut) return;
         finish(resolve, { exitCode, ...captured });
       });
+
+      if (abortSignal) {
+        abortHandler = () => {
+          const captured = output();
+          try { child.kill('SIGTERM'); } catch { /* the child may already have exited */ }
+          finish(reject, new PatchPoolError('COMMAND_ABORTED', `Command was aborted: ${redact(command)}`, captured));
+        };
+        abortSignal.addEventListener('abort', abortHandler, { once: true });
+        if (abortSignal.aborted) abortHandler();
+      }
 
       if (options.stdin !== undefined && child.stdin) child.stdin.end(options.stdin);
       else if (child.stdin) child.stdin.end();

@@ -77,8 +77,8 @@ export class GitHubClient {
     this.command = command;
   }
 
-  async run(args, operation) {
-    const result = await this.runner.run(this.command, args);
+  async run(args, operation, options) {
+    const result = await this.runner.run(this.command, args, options);
     assertSuccess(result, operation);
     return result;
   }
@@ -154,28 +154,28 @@ export class GitHubClient {
     };
   }
 
-  async findPullRequest(fullName, branch) {
+  async findPullRequest(fullName, branch, options) {
     const canonical = requireFullName(fullName);
     if (typeof branch !== 'string' || branch.length === 0 || /[\r\n]/.test(branch)) throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch is required');
-    const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all', '--json', PR_JSON_FIELDS], 'pull request lookup');
+    const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all', '--json', PR_JSON_FIELDS], 'pull request lookup', options);
     const value = jsonArray(result.stdout, 'pull request lookup');
     return value.find(pr => pr?.headRefName === branch) ?? null;
   }
 
-  async createDraftPullRequest(input) {
+  async createDraftPullRequest(input, options) {
     const canonical = repositoryName(input?.repository ?? input?.fullName);
     const branch = input?.branch;
     if (typeof branch !== 'string' || branch.length === 0 || /[\r\n]/.test(branch)) throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch is required');
     const title = String(input?.title ?? '').trim();
     if (!title) throw new PatchPoolError('GITHUB_INVALID_PR', 'Pull request title is required');
     const base = String(input?.base ?? input?.defaultBranch ?? 'main');
-    const create = await this.run(['pr', 'create', '--repo', canonical, '--head', branch, '--base', base, '--title', title, '--body', String(input?.body ?? ''), '--draft'], 'pull request creation');
+    const create = await this.run(['pr', 'create', '--repo', canonical, '--head', branch, '--base', base, '--title', title, '--body', String(input?.body ?? ''), '--draft'], 'pull request creation', options);
     let structured;
     try { structured = JSON.parse(String(create.stdout ?? '').trim()); } catch { structured = undefined; }
     const createdUrl = structured && typeof structured === 'object' && !Array.isArray(structured) ? structured.url ?? structured.html_url : outputUrl(create.stdout);
     const url = requirePullRequestUrl(createdUrl, canonical);
     if (!url) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub pull request creation returned no URL');
-    const verifyResult = await this.run(['pr', 'view', url, '--json', PR_JSON_FIELDS], 'pull request verification');
+    const verifyResult = await this.run(['pr', 'view', url, '--json', PR_JSON_FIELDS], 'pull request verification', options);
     const verified = jsonObject(verifyResult.stdout, 'pull request verification');
     if (verified.isDraft !== true || verified.headRefName !== branch || verified.baseRefName !== base || prRepository(verified.baseRepository) !== canonical || prRepository(verified.headRepository) !== canonical || typeof verified.body !== 'string') {
       throw new PatchPoolError('GITHUB_PR_NOT_DRAFT', 'Created pull request was not verified as Draft');

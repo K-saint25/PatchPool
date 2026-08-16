@@ -156,7 +156,9 @@ function ensureExecutionLeasesSchema(db) {
       worker_id TEXT NOT NULL,
       token TEXT NOT NULL UNIQUE,
       acquired_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
+      expires_at TEXT NOT NULL,
+      owner_pid INTEGER,
+      owner_session_id TEXT
     );
   `);
   if (!exists) {
@@ -164,15 +166,23 @@ function ensureExecutionLeasesSchema(db) {
     return;
   }
   const targets = db.prepare('PRAGMA foreign_key_list(execution_leases)').all().map(row => row.table);
-  if (targets.length === 1 && targets[0] === 'claims') return;
+  if (targets.length === 1 && targets[0] === 'claims') {
+    const columns = new Set(db.prepare('PRAGMA table_info(execution_leases)').all().map(row => row.name));
+    if (!columns.has('owner_pid')) db.exec('ALTER TABLE execution_leases ADD COLUMN owner_pid INTEGER');
+    if (!columns.has('owner_session_id')) db.exec('ALTER TABLE execution_leases ADD COLUMN owner_session_id TEXT');
+    return;
+  }
+  const legacyColumns = new Set(db.prepare('PRAGMA table_info(execution_leases)').all().map(row => row.name));
+  const ownerPid = legacyColumns.has('owner_pid') ? 'legacy.owner_pid' : 'NULL';
+  const ownerSessionId = legacyColumns.has('owner_session_id') ? 'legacy.owner_session_id' : 'NULL';
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     db.exec('BEGIN');
     db.exec('ALTER TABLE execution_leases RENAME TO execution_leases_legacy');
     create();
     db.exec(`
-      INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at)
-        SELECT legacy.claim_id, legacy.worker_id, legacy.token, legacy.acquired_at, legacy.expires_at
+      INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at, owner_pid, owner_session_id)
+        SELECT legacy.claim_id, legacy.worker_id, legacy.token, legacy.acquired_at, legacy.expires_at, ${ownerPid}, ${ownerSessionId}
         FROM execution_leases_legacy AS legacy
         JOIN claims ON claims.id = legacy.claim_id;
       DROP TABLE execution_leases_legacy;
@@ -183,6 +193,17 @@ function ensureExecutionLeasesSchema(db) {
     throw error;
   } finally {
     db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
+function processIsAlive({ pid }) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
   }
 }
 
@@ -206,9 +227,11 @@ export class PatchPoolStore {
     return new PatchPoolStore(path, options);
   }
 
-  constructor(path, { clock = Date.now, randomId = randomUUID } = {}) {
+  constructor(path, { clock = Date.now, randomId = randomUUID, isOwnerAlive = processIsAlive, ownerSessionId = randomUUID() } = {}) {
     this.clock = clock;
     this.randomId = randomId;
+    this.isOwnerAlive = isOwnerAlive;
+    this.ownerSessionId = ownerSessionId;
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA busy_timeout = 50');
@@ -434,11 +457,12 @@ export class PatchPoolStore {
     return this.getClaim(claimId);
   }
 
-  acquireExecutionLease(claimIdValue, workerIdValue, { ttlMs = 300_000 } = {}) {
+  acquireExecutionLease(claimIdValue, workerIdValue, { ttlMs = 300_000, ownerPid = process.pid, ownerSessionId = this.ownerSessionId } = {}) {
     const claimId = Number(claimIdValue);
     const workerId = String(workerIdValue ?? '').trim();
-    if (!Number.isInteger(claimId) || claimId < 1 || !workerId || !Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new PatchPoolError('INVALID_LEASE', 'claimId, workerId, and a positive ttlMs are required');
+    const sessionId = String(ownerSessionId ?? '').trim();
+    if (!Number.isInteger(claimId) || claimId < 1 || !workerId || !Number.isFinite(ttlMs) || ttlMs <= 0 || !Number.isInteger(ownerPid) || ownerPid <= 0 || !sessionId) {
+      throw new PatchPoolError('INVALID_LEASE', 'claimId, workerId, owner process identity, and a positive ttlMs are required');
     }
     return withImmediateTransaction(this.db, () => {
       const claim = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
@@ -450,16 +474,22 @@ export class PatchPoolStore {
       if (existing && Date.parse(existing.expires_at) > timestamp) {
         throw new PatchPoolError('LEASE_BUSY', 'Claim is already being executed by this worker');
       }
+      if (existing && Number.isInteger(existing.owner_pid) && existing.owner_pid > 0 && typeof existing.owner_session_id === 'string' && existing.owner_session_id) {
+        let alive = true;
+        try { alive = this.isOwnerAlive({ pid: existing.owner_pid, sessionId: existing.owner_session_id }) !== false; } catch { /* fail closed when liveness cannot be established */ }
+        if (alive) throw new PatchPoolError('LEASE_BUSY', 'Expired execution lease owner process is still alive');
+      }
       const acquiredAt = new Date(timestamp).toISOString();
       const expiresAt = new Date(timestamp + ttlMs).toISOString();
       const token = this.randomId();
       this.db.prepare(`
-        INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at, owner_pid, owner_session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(claim_id) DO UPDATE SET worker_id = excluded.worker_id, token = excluded.token,
-          acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
-      `).run(claimId, workerId, token, acquiredAt, expiresAt);
-      return { claimId, workerId, token, acquiredAt, expiresAt };
+          acquired_at = excluded.acquired_at, expires_at = excluded.expires_at,
+          owner_pid = excluded.owner_pid, owner_session_id = excluded.owner_session_id
+      `).run(claimId, workerId, token, acquiredAt, expiresAt, ownerPid, sessionId);
+      return { claimId, workerId, token, acquiredAt, expiresAt, ownerPid, ownerSessionId: sessionId };
     });
   }
 
@@ -470,7 +500,7 @@ export class PatchPoolStore {
     if (!Number.isInteger(claimId) || claimId < 1 || !workerId || !token) throw new PatchPoolError('INVALID_LEASE', 'claimId, workerId, and token are required');
     return withImmediateTransaction(this.db, () => {
       const row = assertLeaseRow(this.db, claimId, workerId, token, this.clock());
-      return { claimId, workerId, token, acquiredAt: row.acquired_at, expiresAt: row.expires_at };
+      return { claimId, workerId, token, acquiredAt: row.acquired_at, expiresAt: row.expires_at, ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id };
     });
   }
 
@@ -487,7 +517,7 @@ export class PatchPoolStore {
       const expiresAt = new Date(timestamp + ttlMs).toISOString();
       this.db.prepare('UPDATE execution_leases SET expires_at = ? WHERE claim_id = ? AND worker_id = ? AND token = ?')
         .run(expiresAt, claimId, workerId, token);
-      return { claimId, workerId, token, acquiredAt: row.acquired_at, expiresAt };
+      return { claimId, workerId, token, acquiredAt: row.acquired_at, expiresAt, ownerPid: row.owner_pid, ownerSessionId: row.owner_session_id };
     });
   }
 

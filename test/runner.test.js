@@ -62,6 +62,31 @@ test('maps an expired process to COMMAND_TIMEOUT', async () => {
   assert.equal(timeoutError?.code, 'COMMAND_TIMEOUT');
 });
 
+test('aborting a running command terminates the child and reports COMMAND_ABORTED', async () => {
+  const signals = [];
+  const runner = new CommandRunner({ spawnFn: hangingSpawn(signals) });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal, timeoutMs: 60_000 });
+  controller.abort(new Error('lease lost'));
+  await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
+  assert.deepEqual(signals, ['SIGTERM']);
+});
+
+test('does not miss cancellation that occurs while the child is being spawned', async () => {
+  const controller = new AbortController();
+  const signals = [];
+  const spawnFn = () => {
+    controller.abort();
+    return hangingSpawn(signals)();
+  };
+  const runner = new CommandRunner({ spawnFn });
+  await assert.rejects(
+    runner.run('git', ['push'], { signal: controller.signal, timeoutMs: 10 }),
+    error => error.code === 'COMMAND_ABORTED',
+  );
+  assert.deepEqual(signals, ['SIGTERM']);
+});
+
 test('returns captured stdout and stderr and closes stdin', async () => {
   let input;
   const spawnFn = (command, args, options) => {

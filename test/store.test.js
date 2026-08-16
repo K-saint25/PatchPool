@@ -284,6 +284,7 @@ test('an expired lease holder cannot renew or overwrite after a replacement toke
   const store = PatchPoolStore.open(path, {
     clock: () => currentTime,
     randomId: () => `lease-token-${++tokenNumber}`,
+    isOwnerAlive: () => false,
   });
   try {
     const repo = store.registerRepository(approvedRepo());
@@ -302,6 +303,57 @@ test('an expired lease holder cannot renew or overwrite after a replacement toke
     );
     const running = store.transitionClaimWithLease(claim.id, 'running', { branch: 'current' }, replacement);
     assert.equal(running.branch, 'current');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired lease cannot be taken over while its owner process session is alive', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-live-owner-'));
+  const path = join(directory, 'state.sqlite');
+  let currentTime = 1_000;
+  const checkedOwners = [];
+  const store = PatchPoolStore.open(path, {
+    clock: () => currentTime,
+    randomId: () => 'live-owner-token',
+    isOwnerAlive: owner => { checkedOwners.push(owner); return true; },
+  });
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 17, workerId: 'worker-a' });
+    store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10, ownerPid: 4321, ownerSessionId: 'session-one' });
+    currentTime += 11;
+    assert.throws(
+      () => store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100, ownerPid: 9876, ownerSessionId: 'session-two' }),
+      error => error.code === 'LEASE_BUSY',
+    );
+    assert.deepEqual(checkedOwners, [{ pid: 4321, sessionId: 'session-one' }]);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired lease can be recovered after its owner process is dead', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-dead-owner-'));
+  const path = join(directory, 'state.sqlite');
+  let currentTime = 1_000;
+  let token = 0;
+  const store = PatchPoolStore.open(path, {
+    clock: () => currentTime,
+    randomId: () => `dead-owner-token-${++token}`,
+    isOwnerAlive: () => false,
+  });
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 18, workerId: 'worker-a' });
+    const stale = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10, ownerPid: 4321, ownerSessionId: 'session-one' });
+    currentTime += 11;
+    const replacement = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100, ownerPid: 9876, ownerSessionId: 'session-two' });
+    assert.notEqual(replacement.token, stale.token);
+    assert.equal(replacement.ownerPid, 9876);
+    assert.equal(replacement.ownerSessionId, 'session-two');
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });

@@ -90,6 +90,24 @@ test('issue, list, clone, viewer, remote, and PR methods use safe gh argv', asyn
   assert.deepEqual(runner.calls[7].args, ['pr', 'view', 'https://github.com/octo/example/pull/10', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,baseRepository,body']);
 });
 
+test('pull request commands receive cancellation and bounded timeout options', async () => {
+  const runner = scriptedRunner([
+    { exitCode: 0, stdout: '[]', stderr: '' },
+    { exitCode: 0, stdout: 'https://github.com/octo/example/pull/10\n', stderr: '' },
+    { exitCode: 0, stdout: JSON.stringify({ number: 10, url: 'https://github.com/octo/example/pull/10', isDraft: true, headRefName: 'patch/4', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #4' }), stderr: '' },
+  ]);
+  const client = new GitHubClient({ runner });
+  const controller = new AbortController();
+  const options = { signal: controller.signal, timeoutMs: 12_345 };
+  await client.findPullRequest('octo/example', 'patch/4', options);
+  await client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body', base: 'main' }, options);
+  assert.equal(runner.calls.length, 3);
+  for (const call of runner.calls) {
+    assert.equal(call.options.signal, controller.signal);
+    assert.equal(call.options.timeoutMs, 12_345);
+  }
+});
+
 test('createDraftPullRequest rejects a response that is not verified as Draft', async () => {
   const runner = scriptedRunner([{ exitCode: 0, stdout: 'https://github.com/octo/example/pull/1\n', stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 1, url: 'https://github.com/octo/example/pull/1', isDraft: false }), stderr: '' }]);
   const client = new GitHubClient({ runner });

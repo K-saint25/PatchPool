@@ -484,6 +484,7 @@ test('heartbeat renews the lease while Codex is running longer than its TTL', as
   const running = workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
   while (!finishCodex) await new Promise(resolve => setTimeout(resolve, 1));
   await new Promise(resolve => setTimeout(resolve, 90));
+  setupState.store.assertExecutionLease(capturedLease.claimId, capturedLease.workerId, capturedLease.token);
   assert.throws(
     () => acquire(capturedLease.claimId, capturedLease.workerId, { ttlMs: 40 }),
     error => error.code === 'LEASE_BUSY',
@@ -491,6 +492,50 @@ test('heartbeat renews the lease while Codex is running longer than its TTL', as
   finishCodex();
   const result = await running;
   assert.equal(result.state, 'verified');
+  setupState.store.close();
+});
+
+test('lease loss aborts an in-flight push and supplies a bounded command timeout', async () => {
+  const setupState = setup();
+  let capturedLease;
+  let heartbeat;
+  let pushOptions;
+  const acquire = setupState.store.acquireExecutionLease.bind(setupState.store);
+  setupState.store.acquireExecutionLease = (...args) => {
+    capturedLease = acquire(...args);
+    return capturedLease;
+  };
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    if (command === 'git' && args.includes('push')) {
+      pushOptions = options;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        setupState.store.releaseExecutionLease(capturedLease.claimId, capturedLease.workerId, capturedLease.token);
+        acquire(capturedLease.claimId, capturedLease.workerId, { ttlMs: 60_000, ownerPid: 9999, ownerSessionId: 'replacement' });
+        queueMicrotask(() => heartbeat());
+      });
+    }
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    workerId: 'worker-a',
+    externalOperationTimeoutMs: 12_345,
+    setIntervalFn: callback => { heartbeat = callback; return { unref() {} }; },
+    clearIntervalFn: () => {},
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {},
+  });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }),
+    error => error.code === 'LEASE_LOST',
+  );
+  assert.equal(pushOptions.timeoutMs, 12_345);
+  assert.equal(pushOptions.signal.aborted, true);
+  assert.equal(setupState.store.getClaim(capturedLease.claimId).state, 'committed');
   setupState.store.close();
 });
 
