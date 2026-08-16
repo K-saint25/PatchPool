@@ -64,10 +64,16 @@ function outputUrl(stdout) {
   return trimmed.split(/\s+/).find(value => /^https:\/\/github\.com\//.test(value));
 }
 
-const PR_JSON_FIELDS = 'number,url,isDraft,headRefName,baseRefName,headRepository,baseRepository,body';
+const PR_JSON_FIELDS = 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body';
 
 function prRepository(value) {
   return value?.fullName ?? value?.nameWithOwner ?? value?.full_name;
+}
+
+function normalizeRepoScopedPullRequest(value, canonical) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      value.isCrossRepository !== false || prRepository(value.headRepository) !== canonical) return null;
+  return { ...value, baseRepository: { fullName: canonical } };
 }
 
 export class GitHubClient {
@@ -159,7 +165,12 @@ export class GitHubClient {
     if (typeof branch !== 'string' || branch.length === 0 || /[\r\n]/.test(branch)) throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch is required');
     const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all', '--json', PR_JSON_FIELDS], 'pull request lookup', options);
     const value = jsonArray(result.stdout, 'pull request lookup');
-    return value.find(pr => pr?.headRefName === branch) ?? null;
+    for (const pullRequest of value) {
+      if (pullRequest?.headRefName !== branch) continue;
+      const normalized = normalizeRepoScopedPullRequest(pullRequest, canonical);
+      if (normalized) return normalized;
+    }
+    return null;
   }
 
   async createDraftPullRequest(input, options) {
@@ -176,8 +187,8 @@ export class GitHubClient {
     const url = requirePullRequestUrl(createdUrl, canonical);
     if (!url) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub pull request creation returned no URL');
     const verifyResult = await this.run(['pr', 'view', url, '--json', PR_JSON_FIELDS], 'pull request verification', options);
-    const verified = jsonObject(verifyResult.stdout, 'pull request verification');
-    if (verified.isDraft !== true || verified.headRefName !== branch || verified.baseRefName !== base || prRepository(verified.baseRepository) !== canonical || prRepository(verified.headRepository) !== canonical || typeof verified.body !== 'string') {
+    const verified = normalizeRepoScopedPullRequest(jsonObject(verifyResult.stdout, 'pull request verification'), canonical);
+    if (!verified || verified.isDraft !== true || verified.headRefName !== branch || verified.baseRefName !== base || prRepository(verified.baseRepository) !== canonical || prRepository(verified.headRepository) !== canonical || typeof verified.body !== 'string') {
       throw new PatchPoolError('GITHUB_PR_NOT_DRAFT', 'Created pull request was not verified as Draft');
     }
     const verifiedUrl = verified.url === undefined ? url : requirePullRequestUrl(verified.url, canonical);

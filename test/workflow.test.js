@@ -264,6 +264,52 @@ test('ambiguous PR creation reconciles the existing matching Draft PR without re
   setupState.store.close();
 });
 
+test('PR lookup and cleanup failures after a successful push preserve pushed state for idempotent reconciliation', async () => {
+  const setupState = setup();
+  let lookups = 0;
+  setupState.github.findPullRequest = async () => {
+    lookups += 1;
+    if (lookups === 1) throw Object.assign(new Error('PR lookup unavailable'), { code: 'GITHUB_COMMAND_FAILED' });
+    return {
+      url: 'https://github.com/octo/example/pull/9',
+      isDraft: true,
+      headRefName: 'patchpool/issue-1-1',
+      baseRefName: 'main',
+      baseRepository: { fullName: 'octo/example' },
+      headRepository: { fullName: 'octo/example' },
+      body: 'AI-assisted implementation. Closes #1',
+    };
+  };
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflowOptions = {
+    ...setupState,
+    workerId: 'worker-a',
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {
+      if (lookups === 1) throw new Error('cleanup unavailable');
+    },
+  };
+  const workflow = new IssueWorkflow(workflowOptions);
+
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }),
+    error => error.code === 'WORKFLOW_CLEANUP_FAILED',
+  );
+  const pushed = setupState.store.db.prepare('SELECT id FROM claims ORDER BY id DESC LIMIT 1').get();
+  assert.equal(setupState.store.getClaim(pushed.id).state, 'pushed');
+
+  const resumed = await new IssueWorkflow(workflowOptions).run({ repo: 'octo/example', issueNumber: 1, publish: true });
+  assert.equal(resumed.state, 'pr_opened');
+  assert.equal(setupState.calls.filter(call => call[0] === 'codex').length, 1);
+  assert.equal(setupState.calls.filter(call => call[0] === 'run' && call[2]?.includes('push')).length, 1);
+  setupState.store.close();
+});
+
 test('rejects a pull-request-shaped issue before cloning or claiming', async () => {
   const setupState = setup();
   setupState.github.getIssue = async () => ({ number: 1, title: 'PR', state: 'OPEN', assignees: [], labels: REQUIRED_LABELS, pull_request: { url: 'https://github.com/octo/example/pull/1' } });
