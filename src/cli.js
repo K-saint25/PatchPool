@@ -11,7 +11,10 @@ function parseArguments(argv) {
       continue;
     }
     const key = argument.slice(2).replaceAll('-', '_');
-    if (key === 'json' || key === 'public' || key === 'private' || key === 'inactive') {
+    if (key === 'private') {
+      throw new PatchPoolError('INVALID_ARGS', 'Private repositories are not eligible for PatchPool claims');
+    }
+    if (key === 'json' || key === 'public' || key === 'inactive') {
       options[key] = true;
       continue;
     }
@@ -69,7 +72,7 @@ async function dispatch(argv, { store, stdout }) {
       requiredLabel: options.required_label,
       blockingLabels: options.blocking_labels ?? [],
       active: !options.inactive,
-      public: !options.private,
+      public: true,
     });
     emit(stdout, repository);
     return repository;

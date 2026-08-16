@@ -4,6 +4,8 @@ import { PatchPoolError } from './errors.js';
 const SCHEMA_VERSION = 1;
 const ACTIVE_STATES = ['claimed', 'working', 'verifying'];
 const STATES = new Set(['claimed', 'working', 'verifying', 'completed', 'failed', 'released']);
+const BUSY_RETRY_ATTEMPTS = 20;
+const BUSY_RETRY_WAIT_MS = 10;
 const TRANSITIONS = new Map([
   ['claimed', new Set(['working', 'failed', 'released'])],
   ['working', new Set(['verifying', 'failed', 'released'])],
@@ -57,7 +59,9 @@ function mapRepository(row) {
 
 function mapClaim(row) {
   if (!row) return null;
+  const fields = json(row.fields_json, {});
   return {
+    ...fields,
     id: row.id,
     repoId: row.repo_id,
     issueNumber: row.issue_number,
@@ -65,12 +69,26 @@ function mapClaim(row) {
     state: row.state,
     claimedAt: row.claimed_at,
     updatedAt: row.updated_at,
-    ...json(row.fields_json, {}),
   };
 }
 
 function withImmediateTransaction(db, operation) {
-  db.exec('BEGIN IMMEDIATE');
+  let begun = false;
+  for (let attempt = 0; attempt < BUSY_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      begun = true;
+      break;
+    } catch (error) {
+      const busy = /busy|locked/i.test(`${error?.code ?? ''} ${error?.message ?? ''}`);
+      if (!busy) throw error;
+      if (attempt === BUSY_RETRY_ATTEMPTS - 1) {
+        throw new PatchPoolError('STORE_BUSY', 'SQLite store remained locked during the bounded claim transaction retry window', { cause: error?.message });
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, BUSY_RETRY_WAIT_MS);
+    }
+  }
+  if (!begun) throw new PatchPoolError('STORE_BUSY', 'Unable to begin the SQLite transaction');
   try {
     const result = operation();
     db.exec('COMMIT');
@@ -89,6 +107,7 @@ export class PatchPoolStore {
   constructor(path) {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA foreign_keys = ON');
+    this.db.exec('PRAGMA busy_timeout = 50');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_meta (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -143,6 +162,9 @@ export class PatchPoolStore {
   registerRepository(input) {
     if (!input || !input.configDigest) {
       throw new PatchPoolError('INVALID_REPOSITORY', 'Repository configDigest is required');
+    }
+    if (input.public === false || input.isPublic === false || String(input.visibility ?? '').toLowerCase() === 'private') {
+      throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
     }
     const fullName = canonicalFullName(input.fullName);
     if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
@@ -200,7 +222,10 @@ export class PatchPoolStore {
       throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, and workerId are required');
     }
     return withImmediateTransaction(this.db, () => {
-      if (!this.getRepositoryById(repoId)) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Unknown repository id: ${repoId}`);
+      const repository = this.getRepositoryById(repoId);
+      if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Unknown repository id: ${repoId}`);
+      if (!repository.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${repository.fullName}`);
+      if (!repository.public) throw new PatchPoolError('REPOSITORY_NOT_PUBLIC', `Repository is not public: ${repository.fullName}`);
       const timestamp = now();
       try {
         const result = this.db.prepare(`

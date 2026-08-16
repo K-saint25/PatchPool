@@ -61,3 +61,28 @@ test('claim resolves the repository and creates an issue claim', async () => {
     store.close();
   }
 });
+
+test('repo add rejects the private-registration path', async () => {
+  const store = memoryStore();
+  try {
+    await assert.rejects(
+      () => main(['repo', 'add', '--repo', 'octo/private', '--private', '--config-digest', 'sha256:one'], { store, stdout() {} }),
+      error => error.code === 'INVALID_ARGS',
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('claim rejects an inactive registered repository', async () => {
+  const store = memoryStore();
+  try {
+    store.registerRepository({ fullName: 'octo/inactive', active: false, configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    await assert.rejects(
+      () => main(['claim', '--repo', 'octo/inactive', '--issue', '7', '--worker', 'worker-a'], { store, stdout() {} }),
+      error => error.code === 'REPOSITORY_INACTIVE',
+    );
+  } finally {
+    store.close();
+  }
+});
