@@ -29,6 +29,19 @@ test('buildImplementationPrompt safely handles missing issue fields', () => {
   assert.match(prompt, /<untrusted-issue>/);
 });
 
+test('buildImplementationPrompt reserves verification for the caller and stops after editing', () => {
+  const prompt = buildImplementationPrompt({
+    repository: { fullName: 'octo/example' },
+    issue: { number: 9, title: 'Small fix', body: 'Make the requested change.' },
+    verificationArgv: ['node', '--test'],
+  });
+  const trustedRules = prompt.split('<untrusted-data>')[0];
+  assert.match(trustedRules, /caller (?:owns|will run).*verification/i);
+  assert.match(trustedRules, /do not run (?:the )?verification command/i);
+  assert.match(trustedRules, /broad test suites/i);
+  assert.match(trustedRules, /edits are complete, stop immediately/i);
+});
+
 test('buildImplementationPrompt rejects a non-canonical repository name', () => {
   assert.throws(() => buildImplementationPrompt({ repository: { fullName: 'https://github.com/octo/example' }, issue: {} }), error => error.code === 'PROMPT_INVALID_REPOSITORY');
 });

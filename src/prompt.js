@@ -30,6 +30,7 @@ export function buildImplementationPrompt({ repository, issue, verificationArgv 
     'Do not commit, push, create a pull request, alter git history, or publish anything.',
     'Make the smallest complete code and test change. Preserve unrelated user changes.',
     `After editing, the caller will run this exact verification command: ${JSON.stringify(verificationArgv)}.`,
+    'The caller owns verification: do not run the verification command or broad test suites; once the required code and test edits are complete, stop immediately.',
     'Do not add files during verification and do not claim success unless the change is actually implemented.',
     '<untrusted-data>',
     `Repository: ${fullName}`,
