@@ -3,6 +3,14 @@ import { join } from 'node:path';
 import { PatchPoolError } from './errors.js';
 
 const WINDOWS_SANDBOX_CONFIG = 'windows.sandbox="elevated"';
+const CODEX_CAPABILITY_FLAGS = [
+  '--disable', 'plugins',
+  '--disable', 'apps',
+  '--disable', 'browser_use',
+  '--disable', 'computer_use',
+  '--disable', 'multi_agent',
+  '--disable', 'multi_agent_v2',
+];
 
 function rateLimited(value) {
   return /(?:rate[ -]?limit|rate_limit|too many requests|quota exceeded|429)/i.test(String(value ?? ''));
@@ -58,7 +66,7 @@ export class CodexClient {
     const { command, prefix } = invocation(this.options);
     const platformConfig = this.options.platform === 'win32' ? ['-c', WINDOWS_SANDBOX_CONFIG] : [];
     const modelConfig = this.options.model ? ['--model', this.options.model] : [];
-    const args = [...prefix, ...platformConfig, ...modelConfig, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
+    const args = [...prefix, ...platformConfig, ...modelConfig, ...CODEX_CAPABILITY_FLAGS, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
     let result;
     try {
       result = await this.runner.run(command, args, { cwd, stdin: prompt, timeoutMs, ...(env ? { env } : {}) });
