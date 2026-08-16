@@ -184,7 +184,7 @@ export function assertRepositoryApproval(repository, { approvedTimeoutMs, resolu
       !Number.isFinite(approvedTimeoutMs) || approvedTimeoutMs <= 0 || approvedTimeoutMs !== expectedTimeoutMs) {
     reapprovalRequired();
   }
-  return { approvedConfig, approvedTimeoutMs: expectedTimeoutMs };
+  return { approvedConfig, approvedTimeoutMs: expectedTimeoutMs, configDigest: expectedDigest };
 }
 
 export { MAX_TIMEOUT_MINUTES, MIN_TIMEOUT_MINUTES };

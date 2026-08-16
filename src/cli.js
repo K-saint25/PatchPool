@@ -109,7 +109,10 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
     }
     const repository = store.getRepository(fullName);
     if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${fullName}`);
-    const claim = store.claimIssue({ repoId: repository.id, issueNumber, workerId, expectedConfigDigest: repository.configDigest });
+    const timeoutMinutes = repository.policy?.approvedConfig?.timeoutMinutes;
+    const approvedTimeoutMs = Number.isInteger(timeoutMinutes) ? timeoutMinutes * 60 * 1_000 : undefined;
+    const approval = assertRepositoryApproval(repository, { approvedTimeoutMs });
+    const claim = store.claimIssue({ repoId: repository.id, issueNumber, workerId, expectedConfigDigest: approval.configDigest });
     emit(stdout, claim);
     return claim;
   }

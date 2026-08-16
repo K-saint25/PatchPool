@@ -253,7 +253,7 @@ test('repo list --json prints all registered repositories as JSON', async () => 
   const store = memoryStore();
   const output = [];
   try {
-    store.registerRepository({ fullName: 'octo/example', configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    store.registerRepository(approvedRepositoryInput());
     await main(['repo', 'list', '--json'], { store, stdout: value => output.push(value) });
     assert.deepEqual(JSON.parse(output.join('')).map(repo => repo.fullName), ['octo/example']);
   } finally {
@@ -277,15 +277,43 @@ test('claim resolves the repository and creates an issue claim', async () => {
   const store = memoryStore();
   const output = [];
   try {
-    store.registerRepository({ fullName: 'octo/example', configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    const repository = store.registerRepository(approvedRepositoryInput());
     const claim = await main(['claim', '--repo', 'octo/example', '--issue', '7', '--worker', 'worker-a'], {
       store,
       stdout: value => output.push(value),
     });
     assert.equal(claim.issueNumber, 7);
+    assert.equal(claim.approvalConfigDigest, repository.configDigest);
     assert.equal(JSON.parse(output.join('')).workerId, 'worker-a');
   } finally {
     store.close();
+  }
+});
+
+test('claim rejects legacy, malformed, argv-mismatched, and tampered approvals without creating a claim', async () => {
+  const approved = approvedRepositoryInput();
+  const invalidRepositories = [
+    { ...approved, fullName: 'octo/legacy', policy: {} },
+    {
+      ...approved,
+      fullName: 'octo/malformed',
+      policy: { approvedConfig: { ...approved.policy.approvedConfig, timeoutMinutes: 0 } },
+    },
+    { ...approved, fullName: 'octo/argv-mismatch', verificationArgv: ['node', '--version'] },
+    { ...approved, fullName: 'octo/tampered', configDigest: 'sha256:tampered' },
+  ];
+  for (const repository of invalidRepositories) {
+    const store = memoryStore();
+    try {
+      store.registerRepository(repository);
+      await assert.rejects(
+        () => main(['claim', '--repo', repository.fullName, '--issue', '7', '--worker', 'worker-a'], { store, stdout() {} }),
+        error => error.code === 'REPOSITORY_REAPPROVAL_REQUIRED',
+      );
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+    } finally {
+      store.close();
+    }
   }
 });
 
@@ -304,7 +332,7 @@ test('repo add rejects the private-registration path', async () => {
 test('claim rejects an inactive registered repository', async () => {
   const store = memoryStore();
   try {
-    store.registerRepository({ fullName: 'octo/inactive', active: false, configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    store.registerRepository(approvedRepositoryInput({ fullName: 'octo/inactive', active: false }));
     await assert.rejects(
       () => main(['claim', '--repo', 'octo/inactive', '--issue', '7', '--worker', 'worker-a'], { store, stdout() {} }),
       error => error.code === 'REPOSITORY_INACTIVE',
