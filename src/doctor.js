@@ -12,11 +12,84 @@ const REQUIRED_SCHEMA = new Map([
   ['execution_leases', ['claim_id', 'worker_id', 'token', 'acquired_at', 'expires_at', 'owner_pid', 'owner_session_id']],
 ]);
 
-async function checked(operation, failureCode) {
+const DIAGNOSTICS = Object.freeze({
+  NODE_VERSION_UNSUPPORTED: {
+    message: 'Node.js 24 or newer is required.',
+    hint: 'Install Node.js 24 or newer, then rerun PatchPool doctor.',
+  },
+  GITHUB_AUTH_REQUIRED: {
+    message: 'The GitHub CLI is unavailable or not authenticated.',
+    hint: 'Install or ensure the `gh` CLI is available, run `gh auth login`, then verify with `gh auth status`.',
+  },
+  GITHUB_COMMAND_FAILED: {
+    message: 'The GitHub CLI is unavailable or not authenticated.',
+    hint: 'Install or ensure the `gh` CLI is available, run `gh auth login`, then verify with `gh auth status`.',
+  },
+  CODEX_AUTH_REQUIRED: {
+    message: 'The Codex CLI is unavailable or not authenticated with the ChatGPT subscription flow.',
+    hint: 'Install or ensure the Codex CLI is available, run `codex login` with the ChatGPT subscription flow, then verify with `codex login status`.',
+  },
+  CODEX_NOT_FOUND: {
+    message: 'The Codex CLI could not be located safely.',
+    hint: 'Install the Codex CLI, run `codex login` with the ChatGPT subscription flow, then verify with `codex login status`.',
+  },
+  GIT_IDENTITY_MISSING: {
+    message: 'Git author name and email are not configured.',
+    hint: 'Set `git config --global user.name` and `git config --global user.email`, then rerun PatchPool doctor.',
+  },
+  STATE_DATABASE_PARENT_UNAVAILABLE: {
+    message: 'The state database parent directory is unavailable or not writable.',
+    hint: 'Create the parent directory or choose a writable PATCHPOOL_DB path, then rerun PatchPool doctor.',
+  },
+  STATE_DATABASE_NOT_WRITABLE: {
+    message: 'The existing state database is not a readable and writable file.',
+    hint: 'Check the state file permissions or choose a writable PATCHPOOL_DB path, then rerun PatchPool doctor.',
+  },
+  STATE_DATABASE_SCHEMA_INCOMPATIBLE: {
+    message: 'The state database schema is incompatible with this PatchPool version.',
+    hint: 'Use a compatible PatchPool state database; back it up before any manual recovery.',
+  },
+  STATE_DATABASE_INVALID: {
+    message: 'The existing state database failed read-only validation.',
+    hint: 'Check the database integrity and compatibility; back it up before any manual recovery.',
+  },
+  STATE_DATABASE_UNAVAILABLE: {
+    message: 'The state database could not be checked.',
+    hint: 'Check the PATCHPOOL_DB path, its parent permissions, and database compatibility, then rerun PatchPool doctor.',
+  },
+});
+
+const FAILURE_POLICIES = Object.freeze({
+  node: { failureCode: 'NODE_VERSION_UNSUPPORTED', safeCodes: new Set(['NODE_VERSION_UNSUPPORTED']) },
+  github: { failureCode: 'GITHUB_AUTH_REQUIRED', safeCodes: new Set(['GITHUB_AUTH_REQUIRED', 'GITHUB_COMMAND_FAILED']) },
+  codex: { failureCode: 'CODEX_AUTH_REQUIRED', safeCodes: new Set(['CODEX_AUTH_REQUIRED', 'CODEX_NOT_FOUND']) },
+  gitIdentity: { failureCode: 'GIT_IDENTITY_MISSING', safeCodes: new Set(['GIT_IDENTITY_MISSING']) },
+  stateDatabase: {
+    failureCode: 'STATE_DATABASE_UNAVAILABLE',
+    safeCodes: new Set([
+      'STATE_DATABASE_PARENT_UNAVAILABLE',
+      'STATE_DATABASE_NOT_WRITABLE',
+      'STATE_DATABASE_SCHEMA_INCOMPATIBLE',
+      'STATE_DATABASE_INVALID',
+      'STATE_DATABASE_UNAVAILABLE',
+    ]),
+  },
+});
+
+for (const { failureCode, safeCodes } of Object.values(FAILURE_POLICIES)) {
+  for (const code of new Set([failureCode, ...safeCodes])) {
+    if (!DIAGNOSTICS[code]?.message || !DIAGNOSTICS[code]?.hint) {
+      throw new Error(`Doctor diagnostic is incomplete for ${code}`);
+    }
+  }
+}
+
+async function checked(operation, { failureCode, safeCodes, fields } = {}) {
   try {
     return { ok: true, ...(await operation()) };
   } catch (error) {
-    return { ok: false, code: error?.code ?? failureCode };
+    const code = safeCodes?.has(error?.code) ? error.code : failureCode;
+    return { ok: false, code, ...(fields ?? {}), ...DIAGNOSTICS[code] };
   }
 }
 
@@ -61,10 +134,10 @@ function checkStateDatabase(path = '.patchpool.sqlite') {
   if (path === ':memory:') {
     return { path, exists: false, writable: true, openable: true, ephemeral: true };
   }
-  checkParent(path);
   const absolute = resolve(path);
+  checkParent(absolute);
   if (!existsSync(absolute)) {
-    return { path, exists: false, writable: true, openable: true, creatable: true };
+    return { path: absolute, exists: false, writable: true, openable: true, creatable: true };
   }
   try {
     if (!statSync(absolute).isFile()) throw new Error('not a file');
@@ -87,7 +160,7 @@ function checkStateDatabase(path = '.patchpool.sqlite') {
   } finally {
     try { database?.close(); } catch { /* preserve the state check result */ }
   }
-  return { path, exists: true, writable: true, openable: true, integrity: 'ok', schemaVersion };
+  return { path: absolute, exists: true, writable: true, openable: true, integrity: 'ok', schemaVersion };
 }
 
 export async function runDoctor({
@@ -100,14 +173,18 @@ export async function runDoctor({
   const major = Number.parseInt(String(nodeVersion).split('.')[0], 10);
   const node = Number.isInteger(major) && major >= MINIMUM_NODE_MAJOR
     ? { ok: true, version: String(nodeVersion), minimumMajor: MINIMUM_NODE_MAJOR }
-    : { ok: false, code: 'NODE_VERSION_UNSUPPORTED', version: String(nodeVersion), minimumMajor: MINIMUM_NODE_MAJOR };
-  const githubCheck = await checked(() => github.preflight(), 'GITHUB_AUTH_REQUIRED');
-  const codexCheck = await checked(() => codex.preflight(), 'CODEX_AUTH_REQUIRED');
+    : { ok: false, code: 'NODE_VERSION_UNSUPPORTED', version: String(nodeVersion), minimumMajor: MINIMUM_NODE_MAJOR, ...DIAGNOSTICS.NODE_VERSION_UNSUPPORTED };
+  const githubCheck = await checked(() => github.preflight(), FAILURE_POLICIES.github);
+  const codexCheck = await checked(() => codex.preflight(), FAILURE_POLICIES.codex);
   const gitIdentity = await checked(async () => ({
     name: await gitValue(runner, 'user.name'),
     email: await gitValue(runner, 'user.email'),
-  }), 'GIT_IDENTITY_MISSING');
-  const stateDatabase = await checked(() => checkStateDatabase(dbPath), 'STATE_DATABASE_UNAVAILABLE');
+  }), FAILURE_POLICIES.gitIdentity);
+  const statePath = dbPath === ':memory:' ? ':memory:' : resolve(dbPath ?? '.patchpool.sqlite');
+  const stateDatabase = await checked(() => checkStateDatabase(statePath), {
+    ...FAILURE_POLICIES.stateDatabase,
+    fields: { path: statePath },
+  });
   const checks = {
     node,
     github: githubCheck,
@@ -123,7 +200,11 @@ export async function runDoctor({
 export function formatDoctor(result) {
   const lines = [`PatchPool doctor: ${result.ok ? 'ready' : 'not ready'}`];
   for (const [name, check] of Object.entries(result.checks)) {
-    lines.push(`${check.ok ? 'OK' : 'FAIL'} ${name}${check.code ? ` (${check.code})` : ''}`);
+    const detail = check.code ?? (name === 'commitSigning' ? check.mode : undefined);
+    lines.push(`${check.ok ? 'OK' : 'FAIL'} ${name}${detail ? ` (${detail})` : ''}`);
+    if (check.path) lines.push(`  Path: ${check.path}`);
+    if (check.message) lines.push(`  ${check.message}`);
+    if (check.hint) lines.push(`  Hint: ${check.hint}`);
   }
   return `${lines.join('\n')}\n`;
 }
