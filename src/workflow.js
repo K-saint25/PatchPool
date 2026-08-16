@@ -247,7 +247,7 @@ export class IssueWorkflow {
   async fail(claim, error) {
     if (!claim) return;
     const current = this.store.getClaim?.(claim.id);
-    if (!current || ['released', 'pr_opened'].includes(current.state)) return;
+    if (!current || current.state === 'pr_opened') return;
     try {
       this.store.transitionClaim(claim.id, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() });
     } catch {
@@ -272,8 +272,10 @@ export class IssueWorkflow {
   }
 
   async verifyRemote(directory, remoteName, repository) {
-    const result = await this.invoke('git', ['remote', 'get-url', remoteName], { cwd: directory, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git remote');
-    if (!remoteMatches(result.stdout, repository)) throw new PatchPoolError('WORKFLOW_REMOTE_MISMATCH', 'Local Git remote does not match the approved repository');
+    const options = { cwd: directory, env: sanitizeEnvironment(this.environment) };
+    const fetchResult = await this.invoke('git', ['remote', 'get-url', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git fetch remote');
+    const pushResult = await this.invoke('git', ['remote', 'get-url', '--push', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git push remote');
+    if (!remoteMatches(fetchResult.stdout, repository) || !remoteMatches(pushResult.stdout, repository)) throw new PatchPoolError('WORKFLOW_REMOTE_MISMATCH', 'Local Git fetch and push remotes must match the approved repository');
   }
 
   async reusableCommittedWorkspace(directory, commitSha) {
@@ -324,6 +326,7 @@ export class IssueWorkflow {
     let commitSha;
     let pr;
     let branch;
+    let executionLease;
     try {
       const canonical = await this.github.getRepository(fullName);
       if (canonical?.fullName !== fullName || canonical?.public === false || canonical?.isPrivate === true || canonical?.archived === true || canonical?.isArchived === true || ['private', 'internal'].includes(String(canonical?.visibility ?? '').toLowerCase())) throw new PatchPoolError('WORKFLOW_REPOSITORY_INELIGIBLE', `Repository is not eligible: ${fullName}`);
@@ -339,6 +342,9 @@ export class IssueWorkflow {
       }
       const number = issueNumber(issue, requestedIssueNumber);
       claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId });
+      if (typeof this.store.acquireExecutionLease === 'function') {
+        executionLease = this.store.acquireExecutionLease(claim.id, this.workerId);
+      }
 
       const refreshed = await this.refresh(fullName, number, { ...approved, ...canonical });
       branch = claim.branch ?? `patchpool/issue-${number}-${String(claim.id ?? this.randomId())}`;
@@ -360,7 +366,7 @@ export class IssueWorkflow {
         await this.ensureEmptyWorkspace(workspace);
         await this.github.clone(fullName, workspace);
         await this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch');
-        if (claim.state === 'claimed') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
+        if (claim.state === 'claimed' || claim.state === 'running') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
       }
 
       if (claim.state !== 'committed') {
@@ -402,7 +408,7 @@ export class IssueWorkflow {
       return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, prUrl: pr.url, workspace: keepWorkspace ? workspace : undefined };
     } catch (cause) {
       const error = asError(cause);
-      await this.fail(claim, error);
+      if (executionLease) await this.fail(claim, error);
       throw error;
     } finally {
       let cleanupFailure;
@@ -414,8 +420,11 @@ export class IssueWorkflow {
       }
       if (cleanupFailure) {
         await this.persistCleanupFailure(claim);
-        throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
       }
+      if (executionLease && typeof this.store.releaseExecutionLease === 'function') {
+        try { this.store.releaseExecutionLease(executionLease.claimId, executionLease.workerId, executionLease.token); } catch { /* lease expiry remains the recovery path */ }
+      }
+      if (cleanupFailure) throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
     }
   }
 }

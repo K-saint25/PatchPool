@@ -1,20 +1,20 @@
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { PatchPoolError } from './errors.js';
 
 const SCHEMA_VERSION = 1;
 const ACTIVE_STATES = ['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened'];
-const STATES = new Set(['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released']);
+const STATES = new Set(['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed']);
 const BUSY_RETRY_ATTEMPTS = 20;
 const BUSY_RETRY_WAIT_MS = 10;
 const TRANSITIONS = new Map([
-  ['claimed', new Set(['running', 'failed', 'released'])],
-  ['running', new Set(['verified', 'failed', 'released'])],
-  ['verified', new Set(['verified', 'committed', 'failed', 'released'])],
-  ['committed', new Set(['pushed', 'failed', 'released'])],
-  ['pushed', new Set(['pr_opened', 'failed', 'released'])],
+  ['claimed', new Set(['running', 'failed'])],
+  ['running', new Set(['running', 'verified', 'failed'])],
+  ['verified', new Set(['verified', 'committed', 'failed'])],
+  ['committed', new Set(['pushed', 'failed'])],
+  ['pushed', new Set(['pr_opened', 'failed'])],
   ['pr_opened', new Set(['failed'])],
   ['failed', new Set(['failed'])],
-  ['released', new Set()],
 ]);
 
 function now() {
@@ -103,7 +103,7 @@ function withImmediateTransaction(db, operation) {
 
 function migrateWorkflowStates(db) {
   const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get()?.sql ?? '';
-  if (table.includes("'running'") && !table.includes("'working'")) return;
+  if (table.includes("'running'") && !table.includes("'working'") && !table.includes("'released'")) return;
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     db.exec('BEGIN');
@@ -116,14 +116,14 @@ function migrateWorkflowStates(db) {
         repo_id INTEGER NOT NULL REFERENCES repositories(id),
         issue_number INTEGER NOT NULL CHECK (issue_number > 0),
         worker_id TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released')),
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed')),
         fields_json TEXT NOT NULL DEFAULT '{}',
         claimed_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       INSERT INTO claims (id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
         SELECT id, repo_id, issue_number, worker_id,
-          CASE state WHEN 'working' THEN 'running' WHEN 'verifying' THEN 'running' WHEN 'completed' THEN 'failed' ELSE state END,
+          CASE state WHEN 'working' THEN 'running' WHEN 'verifying' THEN 'running' WHEN 'completed' THEN 'failed' WHEN 'released' THEN 'failed' ELSE state END,
           fields_json, claimed_at, updated_at FROM claims_legacy;
       CREATE UNIQUE INDEX claims_one_active_issue
         ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
@@ -182,7 +182,7 @@ export class PatchPoolStore {
         repo_id INTEGER NOT NULL REFERENCES repositories(id),
         issue_number INTEGER NOT NULL CHECK (issue_number > 0),
         worker_id TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released')),
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed')),
         fields_json TEXT NOT NULL DEFAULT '{}',
         claimed_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -195,6 +195,13 @@ export class PatchPoolStore {
         event_type TEXT NOT NULL,
         payload_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS execution_leases (
+        claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+        worker_id TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
       );
     `);
     migrateWorkflowStates(this.db);
@@ -305,7 +312,8 @@ export class PatchPoolStore {
     const claimId = Number(id);
     const requestedState = String(nextState ?? '').toLowerCase();
     const compatibilityWorking = requestedState === 'working';
-    const state = compatibilityWorking ? 'running' : requestedState;
+    const compatibilityReleased = requestedState === 'released';
+    const state = compatibilityWorking ? 'running' : (compatibilityReleased ? 'failed' : requestedState);
     if (!Number.isInteger(claimId) || claimId < 1 || !STATES.has(state)) {
       throw new PatchPoolError('INVALID_TRANSITION', `Unknown claim transition state: ${nextState}`);
     }
@@ -325,7 +333,9 @@ export class PatchPoolStore {
       this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
         .run(claimId, state, JSON.stringify(fields), timestamp);
       const result = this.getClaim(claimId);
-      return compatibilityWorking ? { ...result, state: 'working' } : result;
+      if (compatibilityWorking) return { ...result, state: 'working' };
+      if (compatibilityReleased) return { ...result, state: 'released' };
+      return result;
     });
   }
 
@@ -339,13 +349,55 @@ export class PatchPoolStore {
       const current = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
       if (!current) throw new PatchPoolError('CLAIM_NOT_FOUND', `Unknown claim id: ${claimId}`);
       if (current.state !== 'committed') throw new PatchPoolError('INVALID_TRANSITION', `Cannot restart claim from ${current.state}`);
-      const merged = { ...json(current.fields_json, {}), ...fields };
+      const merged = { ...json(current.fields_json, {}) };
+      for (const key of ['commitSha', 'committedAt', 'workspace', 'pushedAt', 'prUrl', 'openedAt']) delete merged[key];
+      Object.assign(merged, fields);
       const timestamp = now();
       this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
         .run('running', JSON.stringify(merged), timestamp, claimId);
       this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
         .run(claimId, 'running', JSON.stringify(fields), timestamp);
       return this.getClaim(claimId);
+    });
+  }
+
+  acquireExecutionLease(claimIdValue, workerIdValue, { ttlMs = 300_000 } = {}) {
+    const claimId = Number(claimIdValue);
+    const workerId = String(workerIdValue ?? '').trim();
+    if (!Number.isInteger(claimId) || claimId < 1 || !workerId || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new PatchPoolError('INVALID_LEASE', 'claimId, workerId, and a positive ttlMs are required');
+    }
+    return withImmediateTransaction(this.db, () => {
+      const claim = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+      if (!claim) throw new PatchPoolError('CLAIM_NOT_FOUND', `Unknown claim id: ${claimId}`);
+      if (claim.worker_id !== workerId) throw new PatchPoolError('CLAIM_EXISTS', 'Claim belongs to another worker');
+      if (!ACTIVE_STATES.includes(claim.state)) throw new PatchPoolError('LEASE_UNAVAILABLE', 'Claim is not active');
+      const existing = this.db.prepare('SELECT * FROM execution_leases WHERE claim_id = ?').get(claimId);
+      const timestamp = Date.now();
+      if (existing && Date.parse(existing.expires_at) > timestamp) {
+        throw new PatchPoolError('LEASE_BUSY', 'Claim is already being executed by this worker');
+      }
+      const acquiredAt = new Date(timestamp).toISOString();
+      const expiresAt = new Date(timestamp + ttlMs).toISOString();
+      const token = randomUUID();
+      this.db.prepare(`
+        INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(claim_id) DO UPDATE SET worker_id = excluded.worker_id, token = excluded.token,
+          acquired_at = excluded.acquired_at, expires_at = excluded.expires_at
+      `).run(claimId, workerId, token, acquiredAt, expiresAt);
+      return { claimId, workerId, token, acquiredAt, expiresAt };
+    });
+  }
+
+  releaseExecutionLease(claimIdValue, workerIdValue, tokenValue) {
+    const claimId = Number(claimIdValue);
+    const workerId = String(workerIdValue ?? '').trim();
+    const token = String(tokenValue ?? '').trim();
+    if (!Number.isInteger(claimId) || claimId < 1 || !workerId || !token) throw new PatchPoolError('INVALID_LEASE', 'claimId, workerId, and token are required');
+    return withImmediateTransaction(this.db, () => {
+      const result = this.db.prepare('DELETE FROM execution_leases WHERE claim_id = ? AND worker_id = ? AND token = ?').run(claimId, workerId, token);
+      return Number(result.changes) > 0;
     });
   }
 }

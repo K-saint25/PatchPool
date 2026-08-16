@@ -197,3 +197,46 @@ test('migrates a legacy working claim to running without allowing a duplicate wo
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('execution leases serialize same-claim workers and recover after explicit release', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 12, workerId: 'worker-a' });
+    const first = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000 });
+    assert.ok(first.token);
+    assert.throws(() => store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000 }), error => error.code === 'LEASE_BUSY');
+    store.releaseExecutionLease(claim.id, 'worker-a', first.token);
+    const second = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000 });
+    assert.notEqual(second.token, first.token);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('migrates released legacy claims to failed without exposing released in the new schema', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-released-'));
+  const path = join(directory, 'state.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+    INSERT INTO schema_meta VALUES (1, 1);
+    CREATE TABLE repositories (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL COLLATE NOCASE UNIQUE, active INTEGER NOT NULL DEFAULT 1, is_public INTEGER NOT NULL DEFAULT 1, config_digest TEXT NOT NULL, verification_argv TEXT NOT NULL, required_label TEXT, blocking_labels TEXT NOT NULL DEFAULT '[]', policy_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id INTEGER NOT NULL, issue_number INTEGER NOT NULL, worker_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed','working','verifying','completed','failed','released')), fields_json TEXT NOT NULL DEFAULT '{}', claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX claims_one_active_issue ON claims(repo_id, issue_number) WHERE state IN ('claimed','working','verifying');
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, claim_id INTEGER NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    INSERT INTO repositories VALUES (1, 'octo/example', 1, 1, 'sha256:one', '["npm","test"]', NULL, '[]', '{}', '2026-01-01', '2026-01-01');
+    INSERT INTO claims VALUES (1, 1, 13, 'worker-a', 'released', '{}', '2026-01-01', '2026-01-01');
+  `);
+  legacy.close();
+  const store = PatchPoolStore.open(path);
+  try {
+    assert.equal(store.getClaim(1).state, 'failed');
+    const schema = store.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get().sql;
+    assert.equal(/released/.test(schema), false);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

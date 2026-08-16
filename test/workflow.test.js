@@ -328,3 +328,61 @@ test('rejects a local origin remote that resolves to another repository', async 
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_REMOTE_MISMATCH');
   setupState.store.close();
 });
+
+test('checks both fetch and push URLs before pushing', async () => {
+  const setupState = setup();
+  const remoteCalls = [];
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'remote') {
+      remoteCalls.push(args);
+      return { exitCode: 0, stdout: args.includes('--push') ? 'https://github.com/other/repo.git\n' : 'https://github.com/octo/example.git\n', stderr: '' };
+    }
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_REMOTE_MISMATCH');
+  assert.equal(remoteCalls.some(args => args.includes('--push')), true);
+  setupState.store.close();
+});
+
+test('execution lease prevents concurrent same-worker workflows from running Codex twice', async () => {
+  const setupState = setup();
+  let codexRuns = 0;
+  setupState.codex.implement = async () => { codexRuns += 1; await new Promise(resolve => setTimeout(resolve, 15)); };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const first = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'first-worktree', cleanup: async () => {} });
+  const second = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'second-worktree', cleanup: async () => {} });
+  const results = await Promise.allSettled([
+    first.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    second.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+  ]);
+  assert.equal(codexRuns, 1);
+  assert.equal(results.filter(result => result.status === 'rejected').length, 1);
+  assert.equal(results.find(result => result.status === 'rejected').reason.code, 'LEASE_BUSY');
+  setupState.store.close();
+});
+
+test('restart from a non-reusable committed claim clears stage-specific metadata', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree' });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'old-sha', committedAt: 'old-time', workspace: 'missing-worktree' });
+  setupState.github.clone = async () => {};
+  setupState.runner.run = async (command, args) => {
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 1, stdout: '', stderr: '' };
+    return { exitCode: 0, stdout: command === 'git' && args[0] === 'status' ? ' M src/app.js\n' : '', stderr: '' };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'fresh-worktree', cleanup: async () => {} });
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
+  assert.equal(result.state, 'verified');
+  const fields = setupState.store.getClaim(claim.id);
+  assert.equal(fields.commitSha, undefined);
+  assert.equal(fields.committedAt, undefined);
+  assert.equal(fields.workspace, 'fresh-worktree');
+  setupState.store.close();
+});
