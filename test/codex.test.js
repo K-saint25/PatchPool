@@ -41,6 +41,30 @@ test('implement puts global flags before exec and sends prompt on stdin', async 
   assert.equal(runner.calls[0].options.timeoutMs, 1234);
 });
 
+test('implement adds the selected model to Linux global arguments', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: '{"type":"turn.completed"}\n', stderr: '' }]);
+  const client = new CodexClient({ runner, platform: 'linux', command: 'codex', model: 'gpt-5.6-luna' });
+  await client.implement({ cwd: '/work', prompt: 'x' });
+  assert.deepEqual(runner.calls[0].args, [
+    '--model',
+    'gpt-5.6-luna',
+    '--ask-for-approval',
+    'never',
+    '--sandbox',
+    'workspace-write',
+    '--cd',
+    '/work',
+    'exec',
+    '--json',
+    '--ephemeral',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--color',
+    'never',
+    '-',
+  ]);
+});
+
 test('implement uses the Windows Node executable and installed codex.js without a shell shim', async () => {
   const runner = scriptedRunner([{ exitCode: 0, stdout: '{"type":"turn.completed"}\n', stderr: '' }]);
   const client = new CodexClient({ runner, platform: 'win32', execPath: 'C:\\Program Files\\nodejs\\node.exe', codexPath: 'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js' });
@@ -50,6 +74,39 @@ test('implement uses the Windows Node executable and installed codex.js without 
     'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js',
     '-c',
     'windows.sandbox="elevated"',
+    '--ask-for-approval',
+    'never',
+    '--sandbox',
+    'workspace-write',
+    '--cd',
+    'C:\\work',
+    'exec',
+    '--json',
+    '--ephemeral',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--color',
+    'never',
+    '-',
+  ]);
+});
+
+test('implement adds the selected model after the Windows sandbox override', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: '{"type":"turn.completed"}\n', stderr: '' }]);
+  const client = new CodexClient({
+    runner,
+    platform: 'win32',
+    execPath: 'C:\\Program Files\\nodejs\\node.exe',
+    codexPath: 'C:\\Users\\a\\codex.js',
+    model: 'gpt-5.6-luna',
+  });
+  await client.implement({ cwd: 'C:\\work', prompt: 'x' });
+  assert.deepEqual(runner.calls[0].args, [
+    'C:\\Users\\a\\codex.js',
+    '-c',
+    'windows.sandbox="elevated"',
+    '--model',
+    'gpt-5.6-luna',
     '--ask-for-approval',
     'never',
     '--sandbox',

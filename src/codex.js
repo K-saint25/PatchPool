@@ -31,10 +31,10 @@ function parseEvents(stdout) {
 }
 
 export class CodexClient {
-  constructor({ runner, command = 'codex', platform = process.platform, execPath = process.execPath, codexPath, appData = process.env.APPDATA } = {}) {
+  constructor({ runner, command = 'codex', platform = process.platform, execPath = process.execPath, codexPath, appData = process.env.APPDATA, model } = {}) {
     if (!runner || typeof runner.run !== 'function') throw new TypeError('CodexClient requires a CommandRunner');
     this.runner = runner;
-    this.options = { command, platform, execPath, codexPath, appData };
+    this.options = { command, platform, execPath, codexPath, appData, model };
   }
 
   async preflight() {
@@ -57,7 +57,8 @@ export class CodexClient {
     if (typeof prompt !== 'string') throw new PatchPoolError('CODEX_INVALID_PROMPT', 'Codex prompt is required');
     const { command, prefix } = invocation(this.options);
     const platformConfig = this.options.platform === 'win32' ? ['-c', WINDOWS_SANDBOX_CONFIG] : [];
-    const args = [...prefix, ...platformConfig, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
+    const modelConfig = this.options.model ? ['--model', this.options.model] : [];
+    const args = [...prefix, ...platformConfig, ...modelConfig, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
     let result;
     try {
       result = await this.runner.run(command, args, { cwd, stdin: prompt, timeoutMs, ...(env ? { env } : {}) });

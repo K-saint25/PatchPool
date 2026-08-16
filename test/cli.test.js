@@ -227,6 +227,54 @@ test('two CLI run compositions pass the same worker ID to the workflow', async (
   }
 });
 
+test('CLI run passes a valid model from the injected environment to Codex', async () => {
+  const store = memoryStore();
+  let selectedModel;
+  try {
+    store.registerRepository(approvedRepositoryInput({ fullName: 'octo/modelled' }));
+    await main(['run', '--repo', 'octo/modelled'], {
+      store,
+      environment: {
+        PATCHPOOL_CODEX_MODEL: 'gpt-5.6-luna',
+        PATCHPOOL_WORKER_ID: 'worker-model-test',
+      },
+      stdout() {},
+      workflowFactory(input) {
+        selectedModel = input.codex.options.model;
+        return { run: async () => ({ state: 'verified' }) };
+      },
+    });
+    assert.equal(selectedModel, 'gpt-5.6-luna');
+  } finally {
+    store.close();
+  }
+});
+
+test('CLI run rejects an invalid injected model before creating a workflow', async () => {
+  for (const model of ['gpt/model', '.hidden', 'a'.repeat(101)]) {
+    const store = memoryStore();
+    let workflowCalls = 0;
+    try {
+      store.registerRepository(approvedRepositoryInput({ fullName: 'octo/invalid-model' }));
+      await assert.rejects(
+        () => main(['run', '--repo', 'octo/invalid-model'], {
+          store,
+          environment: { PATCHPOOL_CODEX_MODEL: model, PATCHPOOL_WORKER_ID: 'worker-model-test' },
+          stdout() {},
+          workflowFactory() {
+            workflowCalls += 1;
+            return { run: async () => ({ state: 'verified' }) };
+          },
+        }),
+        error => error.code === 'INVALID_CODEX_MODEL',
+      );
+      assert.equal(workflowCalls, 0);
+    } finally {
+      store.close();
+    }
+  }
+});
+
 test('CLI run rejects a legacy repository before composing or invoking a workflow', async () => {
   const store = memoryStore();
   let workflowCalls = 0;

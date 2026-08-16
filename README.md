@@ -89,6 +89,19 @@ the temporary directory for inspection. A remote write requires an explicit
 node bin/patchpool.js run --repo K-saint25/PatchPool --issue <issue-number> --publish
 ```
 
+Codex chooses its normal default model unless you opt into a specific model
+locally. Set `PATCHPOOL_CODEX_MODEL` to a model slug before starting the worker:
+
+```powershell
+$env:PATCHPOOL_CODEX_MODEL = 'gpt-5.6-luna'
+node bin/patchpool.js run --repo K-saint25/PatchPool --issue <issue-number>
+```
+
+On macOS or Linux, prefix the command with
+`PATCHPOOL_CODEX_MODEL=gpt-5.6-luna`. The choice is entirely user-controlled;
+PatchPool does not automatically fall back to another model or retry a model
+failure because the worktree may already contain partial edits.
+
 Publishing commits with hooks disabled, verifies the remote, pushes a unique
 `patchpool/issue-<number>-<claim-id>` branch, and creates and verifies a Draft
 PR in the canonical repository. The PR body identifies the implementation as
