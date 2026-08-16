@@ -68,7 +68,9 @@ If `--config` is omitted, the CLI automatically loads `.patchpool.json` from
 the current working directory. Registration is immutable in the current store:
 to change an approved policy, use `repo add --config .patchpool.json` again for
 explicit reapproval (and re-register any legacy approved-config record), or use
-a new local state database after review.
+a new local state database after review. `repo list` is read-only: a missing
+state database returns `[]`, while legacy, future, malformed, or otherwise
+incompatible state is rejected without creating or modifying it.
 
 ## Dry-run and publish
 

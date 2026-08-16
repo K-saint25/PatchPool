@@ -30,8 +30,8 @@ function now() {
   return new Date().toISOString();
 }
 
-function canonicalFullName(fullName) {
-  const value = String(fullName ?? '').trim();
+export function requireCanonicalFullName(fullName) {
+  const value = typeof fullName === 'string' ? fullName : '';
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) {
     throw new PatchPoolError('INVALID_REPOSITORY', 'Repository must use the owner/name form');
   }
@@ -59,7 +59,7 @@ function normalizeRepository(input) {
   if (!publicRepository || String(input.visibility ?? '').toLowerCase() === 'private') {
     throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
   }
-  const fullName = canonicalFullName(input.fullName);
+  const fullName = requireCanonicalFullName(input.fullName);
   if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
       input.verificationArgv.some(argument => typeof argument !== 'string' || argument.length === 0)) {
     throw new PatchPoolError('INVALID_REPOSITORY', 'Repository verificationArgv must be a non-empty string array');
@@ -162,6 +162,28 @@ function queryClaimSummaries(database) {
     JOIN repositories ON repositories.id = claims.repo_id
     ORDER BY claims.id ASC
   `).all().map(mapClaimSummary);
+}
+
+function queryRepositories(database) {
+  return database.prepare('SELECT * FROM repositories ORDER BY full_name COLLATE NOCASE').all().map(mapRepository);
+}
+
+function queryCurrentStateReadOnly(path, query) {
+  const requestedPath = String(path ?? '.patchpool.sqlite');
+  if (requestedPath === ':memory:') return [];
+  const absolute = resolve(requestedPath);
+  if (!existsSync(absolute)) return [];
+  let database;
+  try {
+    database = new DatabaseSync(absolute, { readOnly: true });
+    assertCurrentSchema(database);
+    return query(database);
+  } catch (error) {
+    if (error?.code === 'STATE_DATABASE_INCOMPATIBLE') throw error;
+    throw incompatibleStateDatabase();
+  } finally {
+    try { database?.close(); } catch { /* preserve the read result */ }
+  }
 }
 
 function withImmediateTransaction(db, operation) {
@@ -318,21 +340,11 @@ export class PatchPoolStore {
   }
 
   static listClaimsReadOnly(path = '.patchpool.sqlite') {
-    const requestedPath = String(path ?? '.patchpool.sqlite');
-    if (requestedPath === ':memory:') return [];
-    const absolute = resolve(requestedPath);
-    if (!existsSync(absolute)) return [];
-    let database;
-    try {
-      database = new DatabaseSync(absolute, { readOnly: true });
-      assertCurrentSchema(database);
-      return queryClaimSummaries(database);
-    } catch (error) {
-      if (error?.code === 'STATE_DATABASE_INCOMPATIBLE') throw error;
-      throw incompatibleStateDatabase();
-    } finally {
-      try { database?.close(); } catch { /* preserve the read result */ }
-    }
+    return queryCurrentStateReadOnly(path, queryClaimSummaries);
+  }
+
+  static listRepositoriesReadOnly(path = '.patchpool.sqlite') {
+    return queryCurrentStateReadOnly(path, queryRepositories);
   }
 
   constructor(path, { clock = Date.now, randomId = randomUUID, isOwnerAlive = processIsAlive, ownerSessionId = randomUUID() } = {}) {
@@ -465,11 +477,11 @@ export class PatchPoolStore {
   }
 
   getRepository(fullName) {
-    return mapRepository(this.db.prepare('SELECT * FROM repositories WHERE full_name = ? COLLATE NOCASE').get(canonicalFullName(fullName)));
+    return mapRepository(this.db.prepare('SELECT * FROM repositories WHERE full_name = ? COLLATE NOCASE').get(requireCanonicalFullName(fullName)));
   }
 
   listRepositories() {
-    return this.db.prepare('SELECT * FROM repositories ORDER BY full_name COLLATE NOCASE').all().map(mapRepository);
+    return queryRepositories(this.db);
   }
 
   claimIssue(input) {

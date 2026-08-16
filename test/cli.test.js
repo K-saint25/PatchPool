@@ -311,6 +311,26 @@ test('CLI rejects an invalid model before creating the state database', async ()
   }
 });
 
+test('doctor remains available when the optional Codex model is invalid', async () => {
+  const result = await main(['doctor', '--json'], {
+    dbPath: ':memory:',
+    environment: { PATCHPOOL_CODEX_MODEL: 'invalid/model' },
+    nodeVersion: '24.0.0',
+    github: { async preflight() { return { authenticated: true }; } },
+    codex: { async preflight() { return { authenticated: true, provider: 'ChatGPT' }; } },
+    runner: {
+      async run(command, args) {
+        if (command === 'git' && args.at(-1) === 'user.name') return { exitCode: 0, stdout: 'PatchPool Operator\n', stderr: '' };
+        if (command === 'git' && args.at(-1) === 'user.email') return { exitCode: 0, stdout: 'operator@example.test\n', stderr: '' };
+        throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+      },
+    },
+    stdout() {},
+  });
+
+  assert.equal(result.ok, true);
+});
+
 test('CLI run rejects a legacy repository before composing or invoking a workflow', async () => {
   const store = memoryStore();
   let workflowCalls = 0;
@@ -342,6 +362,167 @@ test('repo list --json prints all registered repositories as JSON', async () => 
     assert.deepEqual(JSON.parse(output.join('')).map(repo => repo.fullName), ['octo/example']);
   } finally {
     store.close();
+  }
+});
+
+test('repo list preserves JSON output when the optional --json flag is omitted', async () => {
+  const store = memoryStore();
+  const output = [];
+  try {
+    store.registerRepository(approvedRepositoryInput());
+    await main(['repo', 'list'], { store, stdout: value => output.push(value) });
+    assert.deepEqual(JSON.parse(output.join('')).map(repository => repository.fullName), ['octo/example']);
+  } finally {
+    store.close();
+  }
+});
+
+test('repo list returns an empty array for missing state without creating it or validating a model', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-repo-list-missing-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const output = [];
+  try {
+    const result = await main(['repo', 'list', '--json'], {
+      dbPath,
+      environment: { PATCHPOOL_CODEX_MODEL: 'invalid/model' },
+      stdout: value => output.push(value),
+    });
+    assert.deepEqual(result, []);
+    assert.deepEqual(JSON.parse(output.join('')), []);
+    assert.equal(existsSync(dbPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo list reads a current state database without changing bytes, mtime, or schema metadata', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-repo-list-current-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const state = PatchPoolStore.open(dbPath);
+  state.registerRepository(approvedRepositoryInput({ fullName: 'octo/read-only' }));
+  state.close();
+  const before = fileSnapshot(dbPath);
+  try {
+    const result = await main(['repo', 'list', '--json'], { dbPath, stdout() {} });
+    assert.deepEqual(result.map(repository => repository.fullName), ['octo/read-only']);
+    assert.equal(schemaVersion(dbPath), 1);
+    assert.deepEqual(fileSnapshot(dbPath), before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo list rejects legacy state and invalid commands do not migrate or change it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-repo-list-legacy-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const database = new DatabaseSync(dbPath);
+  database.exec(`
+    CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+    INSERT INTO schema_meta VALUES (1, 1);
+    CREATE TABLE repositories (
+      id INTEGER PRIMARY KEY, full_name TEXT NOT NULL, active INTEGER NOT NULL,
+      is_public INTEGER NOT NULL, config_digest TEXT NOT NULL, verification_argv TEXT NOT NULL,
+      required_label TEXT, blocking_labels TEXT NOT NULL, policy_json TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE claims (
+      id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, issue_number INTEGER NOT NULL,
+      worker_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed','working','verifying','completed','failed','released')),
+      fields_json TEXT NOT NULL, claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE events (id INTEGER PRIMARY KEY, claim_id INTEGER NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE execution_leases (claim_id INTEGER PRIMARY KEY, worker_id TEXT NOT NULL, token TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+  `);
+  database.close();
+  const before = fileSnapshot(dbPath);
+  try {
+    await assert.rejects(
+      () => main(['repo', 'list', '--json'], { dbPath, stdout() {} }),
+      error => error.code === 'STATE_DATABASE_INCOMPATIBLE',
+    );
+    assert.deepEqual(fileSnapshot(dbPath), before);
+    await assert.rejects(
+      () => main(['unknown'], { dbPath, stdout() {} }),
+      error => error.code === 'INVALID_ARGS',
+    );
+    assert.deepEqual(fileSnapshot(dbPath), before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo list rejects future, arbitrary, and malformed databases without changing them', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-repo-list-invalid-'));
+  const futurePath = join(directory, 'future.sqlite');
+  const future = PatchPoolStore.open(futurePath);
+  future.close();
+  const futureWriter = new DatabaseSync(futurePath);
+  futureWriter.prepare('UPDATE schema_meta SET version = 99 WHERE id = 1').run();
+  futureWriter.close();
+  const arbitraryPath = join(directory, 'arbitrary.sqlite');
+  const arbitrary = new DatabaseSync(arbitraryPath);
+  arbitrary.exec('CREATE TABLE sentinel (value TEXT NOT NULL)');
+  arbitrary.close();
+  const malformedPath = join(directory, 'malformed.sqlite');
+  writeFileSync(malformedPath, 'not a SQLite database');
+  try {
+    for (const dbPath of [futurePath, arbitraryPath, malformedPath]) {
+      const before = fileSnapshot(dbPath);
+      await assert.rejects(
+        () => main(['repo', 'list', '--json'], { dbPath, stdout() {} }),
+        error => error.code === 'STATE_DATABASE_INCOMPATIBLE',
+      );
+      assert.deepEqual(fileSnapshot(dbPath), before);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('unknown commands and unsupported options fail before creating state', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-invalid-invocation-'));
+  const invocations = [
+    [],
+    ['unknown'],
+    ['repo', 'unknown'],
+    ['doctor', '--unknown', 'value'],
+    ['repo', 'list', '--unknown', 'value'],
+    ['claim', '--repo', 'octo/example', '--issue', 'not-a-number', '--worker', 'worker-a'],
+    ['run', '--repo', 'octo/example', '--unknown', 'value'],
+  ];
+  try {
+    for (const [index, argv] of invocations.entries()) {
+      const dbPath = join(directory, `state-${index}.sqlite`);
+      await assert.rejects(
+        () => main(argv, { dbPath, stdout() {} }),
+        error => error.code === 'INVALID_ARGS',
+      );
+      assert.equal(existsSync(dbPath), false);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('invalid repository names fail before creating state for every repository command', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-invalid-repository-'));
+  const invocations = [
+    ['repo', 'add', '--repo', 'not-a-repository'],
+    ['claim', '--repo', 'not-a-repository', '--issue', '1', '--worker', 'worker-a'],
+    ['run', '--repo', 'not-a-repository'],
+    ['e2e', '--repo', 'not-a-repository', '--publish'],
+  ];
+  try {
+    for (const [index, argv] of invocations.entries()) {
+      const dbPath = join(directory, `state-${index}.sqlite`);
+      await assert.rejects(
+        () => main(argv, { dbPath, github: eligibleGitHub(), stdout() {} }),
+        error => error.code === 'INVALID_REPOSITORY',
+      );
+      assert.equal(existsSync(dbPath), false);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
