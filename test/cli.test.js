@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { PatchPoolStore } from '../src/store.js';
 import { main, resolveWorkerId } from '../src/cli.js';
 
@@ -19,6 +22,35 @@ test('repo add registers an approved repository and reports JSON', async () => {
     assert.deepEqual(JSON.parse(output.join('')), { ...result });
   } finally {
     store.close();
+  }
+});
+
+test('repo add loads and persists an approved config snapshot without a caller-provided digest', async () => {
+  const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-config-'));
+  const configPath = join(directory, '.patchpool.json');
+  writeFileSync(configPath, JSON.stringify({
+    verifyCommand: [process.execPath, '--test'],
+    requiredIssueLabel: 'patchpool-ready',
+    timeoutMinutes: 30,
+  }));
+  try {
+    const result = await main(['repo', 'add', '--repo', 'octo/configured', '--config', configPath], {
+      store,
+      stdout() {},
+    });
+    assert.match(result.configDigest, /^sha256:[a-f0-9]{64}$/);
+    assert.deepEqual(result.verificationArgv, [process.execPath, '--test']);
+    assert.equal(result.requiredLabel, 'patchpool-ready');
+    assert.deepEqual(result.policy.approvedConfig, {
+      verifyCommand: [process.execPath, '--test'],
+      requiredIssueLabel: 'patchpool-ready',
+      timeoutMinutes: 30,
+    });
+    assert.deepEqual(Object.keys(result.policy), ['approvedConfig']);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

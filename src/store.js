@@ -228,6 +228,7 @@ export class PatchPoolStore {
   }
 
   constructor(path, { clock = Date.now, randomId = randomUUID, isOwnerAlive = processIsAlive, ownerSessionId = randomUUID() } = {}) {
+    this.path = path;
     this.clock = clock;
     this.randomId = randomId;
     this.isOwnerAlive = isOwnerAlive;
