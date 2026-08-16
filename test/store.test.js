@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { PatchPoolStore } from '../src/store.js';
+import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 function openTempStore() {
   const directory = mkdtempSync(join(tmpdir(), 'patchpool-store-'));
@@ -43,6 +44,84 @@ test('registers one canonical repository and persists its approval snapshot', ()
   }
 });
 
+test('reapproves a repository atomically without replacing its identity or claim history', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const original = store.registerRepository(approvedRepo({ active: false }));
+    store.db.prepare(`
+      INSERT INTO claims (repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
+      VALUES (?, 7, 'worker-a', 'failed', '{}', ?, ?)
+    `).run(original.id, original.createdAt, original.createdAt);
+
+    const approvedConfig = {
+      verifyCommand: ['node', '--test'],
+      requiredIssueLabel: 'approved',
+      timeoutMinutes: 10,
+    };
+    const updated = store.reapproveRepository({
+      ...approvedRepo({
+        fullName: 'OCTO/EXAMPLE',
+        configDigest: digestApprovedRepositoryConfig(approvedConfig),
+        verificationArgv: ['node', '--test'],
+        requiredLabel: 'approved',
+        policy: { approvedConfig },
+      }),
+      public: true,
+      active: true,
+    });
+
+    assert.equal(updated.id, original.id);
+    assert.equal(updated.fullName, 'OCTO/EXAMPLE');
+    assert.equal(updated.active, true);
+    assert.equal(updated.public, true);
+    assert.equal(updated.configDigest, digestApprovedRepositoryConfig(approvedConfig));
+    assert.deepEqual(updated.verificationArgv, ['node', '--test']);
+    assert.equal(updated.requiredLabel, 'approved');
+    assert.deepEqual(updated.policy, { approvedConfig });
+    assert.deepEqual(updated.blockingLabels, original.blockingLabels);
+    assert.equal(store.getClaim(1).repoId, original.id);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reapproval refuses to replace policy while any claim is active', () => {
+  const { store, path, directory } = openTempStore();
+  const approvingStore = PatchPoolStore.open(path);
+  try {
+    const original = store.registerRepository(approvedRepo());
+    store.claimIssue({ repoId: original.id, issueNumber: 7, workerId: 'worker-a', expectedConfigDigest: original.configDigest });
+
+    assert.throws(
+      () => approvingStore.reapproveRepository(approvedRepo({ configDigest: 'sha256:config-v2' })),
+      error => error.code === 'REPOSITORY_REAPPROVAL_BUSY',
+    );
+    assert.equal(store.getRepository('octo/example').configDigest, 'sha256:config-v1');
+  } finally {
+    approvingStore.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repository names use the same canonical owner/name grammar as the GitHub adapter', () => {
+  const { store, directory } = openTempStore();
+  try {
+    for (const fullName of ['owner name/repo', 'owner/repo name', 'owner/repo?', '@owner/repo', 'owner//repo']) {
+      assert.throws(
+        () => store.registerRepository(approvedRepo({ fullName })),
+        error => error.code === 'INVALID_REPOSITORY',
+      );
+    }
+    const accepted = store.registerRepository(approvedRepo({ fullName: 'owner.name/repo_name-1' }));
+    assert.equal(accepted.fullName, 'owner.name/repo_name-1');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('persists the approval snapshot across close and reopen', () => {
   const { store, path, directory } = openTempStore();
   try {
@@ -65,11 +144,56 @@ test('only one active claim can own a repository issue', () => {
   const { store, directory } = openTempStore();
   try {
     const repo = store.registerRepository(approvedRepo());
-    const first = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-a' });
+    const first = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     assert.equal(first.state, 'claimed');
     assert.throws(
-      () => store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-b' }),
+      () => store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-b', expectedConfigDigest: repo.configDigest }),
       error => error.code === 'CLAIM_EXISTS',
+    );
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('claim transaction rejects an approval digest that changed after repository validation', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    assert.throws(
+      () => store.claimIssue({
+        repoId: repo.id,
+        issueNumber: 7,
+        workerId: 'worker-a',
+        expectedConfigDigest: 'sha256:stale-approval',
+      }),
+      error => error.code === 'REPOSITORY_APPROVAL_CHANGED',
+    );
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('same-worker resume rejects an active claim recorded under another approval generation', () => {
+  const { store, directory } = openTempStore();
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const timestamp = new Date().toISOString();
+    store.db.prepare(`
+      INSERT INTO claims (repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
+      VALUES (?, 7, 'worker-a', 'claimed', ?, ?, ?)
+    `).run(repo.id, JSON.stringify({ approvalConfigDigest: 'sha256:older-approval' }), timestamp, timestamp);
+
+    assert.throws(
+      () => store.claimIssue({
+        repoId: repo.id,
+        issueNumber: 7,
+        workerId: 'worker-a',
+        expectedConfigDigest: repo.configDigest,
+      }),
+      error => error.code === 'REPOSITORY_APPROVAL_CHANGED',
     );
   } finally {
     store.close();
@@ -85,7 +209,7 @@ test('two store connections normalize concurrent ownership to one claim', async 
     const workerUrl = pathToFileURL(join(process.cwd(), 'support', 'store-claim-worker.js')).href;
     const barrier = new SharedArrayBuffer(4);
     const results = await Promise.all(['worker-a', 'worker-b'].map(workerId => new Promise((resolve, reject) => {
-      const worker = new Worker(new URL(workerUrl), { workerData: { path, repoId: repo.id, workerId, barrier } });
+      const worker = new Worker(new URL(workerUrl), { workerData: { path, repoId: repo.id, workerId, expectedConfigDigest: repo.configDigest, barrier } });
       worker.once('message', resolve);
       worker.once('error', reject);
     })));
@@ -103,11 +227,12 @@ test('refuses claims for inactive and non-public repositories', () => {
   const { store, directory } = openTempStore();
   try {
     const inactive = store.registerRepository(approvedRepo({ fullName: 'octo/inactive', active: false }));
-    assert.throws(() => store.claimIssue({ repoId: inactive.id, issueNumber: 1, workerId: 'worker-a' }), error => error.code === 'REPOSITORY_INACTIVE');
+    assert.throws(() => store.claimIssue({ repoId: inactive.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: inactive.configDigest }), error => error.code === 'REPOSITORY_INACTIVE');
     assert.throws(() => store.registerRepository(approvedRepo({ fullName: 'octo/private-registration', public: false })), error => error.code === 'INVALID_REPOSITORY');
+    assert.throws(() => store.registerRepository(approvedRepo({ fullName: 'octo/private-string', public: 'false' })), error => error.code === 'INVALID_REPOSITORY');
     const privateRepo = store.registerRepository(approvedRepo({ fullName: 'octo/private' }));
     store.db.prepare('UPDATE repositories SET is_public = 0 WHERE id = ?').run(privateRepo.id);
-    assert.throws(() => store.claimIssue({ repoId: privateRepo.id, issueNumber: 1, workerId: 'worker-a' }), error => error.code === 'REPOSITORY_NOT_PUBLIC');
+    assert.throws(() => store.claimIssue({ repoId: privateRepo.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: privateRepo.configDigest }), error => error.code === 'REPOSITORY_NOT_PUBLIC');
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -122,12 +247,16 @@ test('keeps canonical claim fields authoritative over metadata collisions', () =
       repoId: repo.id,
       issueNumber: 7,
       workerId: 'worker-a',
-      fields: { id: 999, repoId: 999, issueNumber: 999, workerId: 'worker-b', state: 'completed' },
+      expectedConfigDigest: repo.configDigest,
+      fields: { id: 999, repoId: 999, issueNumber: 999, workerId: 'worker-b', state: 'completed', approvalConfigDigest: 'sha256:caller' },
     });
     assert.deepEqual(
       { id: claim.id, repoId: claim.repoId, issueNumber: claim.issueNumber, workerId: claim.workerId, state: claim.state },
       { id: claim.id, repoId: repo.id, issueNumber: 7, workerId: 'worker-a', state: 'claimed' },
     );
+    assert.equal(claim.approvalConfigDigest, repo.configDigest);
+    const running = store.transitionClaim(claim.id, 'running', { approvalConfigDigest: 'sha256:transition-caller' });
+    assert.equal(running.approvalConfigDigest, repo.configDigest);
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -138,7 +267,7 @@ test('validates claim transitions and records transition events', () => {
   const { store, directory } = openTempStore();
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const working = store.transitionClaim(claim.id, 'working', { branch: 'patch/7' });
     assert.equal(working.state, 'working');
     assert.equal(working.branch, 'patch/7');
@@ -146,7 +275,7 @@ test('validates claim transitions and records transition events', () => {
     const released = store.transitionClaim(claim.id, 'released', { reason: 'dry-run' });
     assert.equal(released.state, 'released');
     assert.equal(store.getClaim(claim.id).reason, 'dry-run');
-    const replacement = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-b' });
+    const replacement = store.claimIssue({ repoId: repo.id, issueNumber: 7, workerId: 'worker-b', expectedConfigDigest: repo.configDigest });
     assert.equal(replacement.state, 'claimed');
   } finally {
     store.close();
@@ -160,13 +289,13 @@ test('active running and verified claims prevent a different worker from taking 
     const repo = store.registerRepository(approvedRepo());
     const schema = store.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get().sql;
     assert.equal(/working|verifying|completed/.test(schema), false);
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const running = store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-8-1' });
     assert.equal(running.state, 'running');
-    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b', expectedConfigDigest: repo.configDigest }), error => error.code === 'CLAIM_EXISTS');
     const verified = store.transitionClaim(claim.id, 'verified');
     assert.equal(verified.state, 'verified');
-    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+    assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b', expectedConfigDigest: repo.configDigest }), error => error.code === 'CLAIM_EXISTS');
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -191,7 +320,7 @@ test('migrates a legacy working claim to running without allowing a duplicate wo
   const store = PatchPoolStore.open(path);
   try {
     assert.equal(store.getClaim(1).state, 'running');
-    assert.throws(() => store.claimIssue({ repoId: 1, issueNumber: 11, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+    assert.throws(() => store.claimIssue({ repoId: 1, issueNumber: 11, workerId: 'worker-b', expectedConfigDigest: 'sha256:one' }), error => error.code === 'REPOSITORY_APPROVAL_CHANGED');
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -202,7 +331,7 @@ test('execution leases serialize same-claim workers and recover after explicit r
   const { store, directory } = openTempStore();
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 12, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 12, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const first = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000 });
     assert.ok(first.token);
     assert.throws(() => store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 60_000 }), error => error.code === 'LEASE_BUSY');
@@ -251,7 +380,7 @@ test('renews a live execution lease and fences an expired token from state trans
   });
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 14, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 14, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const lease = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100 });
     assert.equal(lease.expiresAt, '2026-01-01T00:00:00.100Z');
 
@@ -288,7 +417,7 @@ test('an expired lease holder cannot renew or overwrite after a replacement toke
   });
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 15, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 15, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const stale = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10 });
     currentTime += 11;
     const replacement = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100 });
@@ -321,7 +450,7 @@ test('an expired lease cannot be taken over while its owner process session is a
   });
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 17, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 17, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10, ownerPid: 4321, ownerSessionId: 'session-one' });
     currentTime += 11;
     assert.throws(
@@ -347,7 +476,7 @@ test('an expired lease can be recovered after its owner process is dead', () => 
   });
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 18, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 18, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     const stale = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10, ownerPid: 4321, ownerSessionId: 'session-one' });
     currentTime += 11;
     const replacement = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100, ownerPid: 9876, ownerSessionId: 'session-two' });
@@ -372,7 +501,7 @@ test('an expired legacy lease without owner identity cannot be taken over automa
   });
   try {
     const repo = store.registerRepository(approvedRepo());
-    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 19, workerId: 'worker-a' });
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 19, workerId: 'worker-a', expectedConfigDigest: repo.configDigest });
     store.db.prepare(`
       INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at, owner_pid, owner_session_id)
       VALUES (?, ?, ?, ?, ?, NULL, NULL)

@@ -125,10 +125,10 @@ export class GitHubClient {
     return jsonArray(result.stdout, 'issue listing');
   }
 
-  async clone(fullName, directory) {
+  async clone(fullName, directory, options) {
     const canonical = requireFullName(fullName);
     if (typeof directory !== 'string' || directory.length === 0) throw new PatchPoolError('GITHUB_INVALID_DIRECTORY', 'Clone directory is required');
-    await this.run(['repo', 'clone', canonical, directory], 'repository clone');
+    await this.run(['repo', 'clone', canonical, directory], 'repository clone', options);
     return directory;
   }
 

@@ -4,19 +4,35 @@ import { PatchPoolStore } from '../src/store.js';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { digestApprovedRepositoryConfig } from '../src/config.js';
 
 test('workflow module is present', async () => {
   const module = await import('../src/workflow.js');
   assert.equal(typeof module.IssueWorkflow, 'function');
 });
 
-function setup({ verificationExitCode = 0 } = {}) {
-  const store = PatchPoolStore.open(':memory:');
-  const repository = store.registerRepository({ fullName: 'octo/example', configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+const APPROVED_CONFIG = {
+  verifyCommand: ['node', '--test'],
+  requiredIssueLabel: 'patchpool-ready',
+  timeoutMinutes: 30,
+};
+const APPROVED_TIMEOUT_MS = 30 * 60 * 1_000;
+const APPROVED_CONFIG_DIGEST = digestApprovedRepositoryConfig(APPROVED_CONFIG);
+const REQUIRED_LABELS = ['patchpool-ready'];
+
+function setup({ verificationExitCode = 0, storePath = ':memory:' } = {}) {
+  const store = PatchPoolStore.open(storePath);
+  const repository = store.registerRepository({
+    fullName: 'octo/example',
+    configDigest: APPROVED_CONFIG_DIGEST,
+    verificationArgv: [...APPROVED_CONFIG.verifyCommand],
+    requiredLabel: APPROVED_CONFIG.requiredIssueLabel,
+    policy: { approvedConfig: APPROVED_CONFIG },
+  });
   const calls = [];
   const github = {
     async getRepository(name) { calls.push(['repo', name]); return { fullName: name, public: true, archived: false, defaultBranch: 'main' }; },
-    async getIssue(name, number) { calls.push(['issue', number]); return { number, title: 'Fix', body: 'body', state: 'OPEN', assignees: [], labels: [] }; },
+    async getIssue(name, number) { calls.push(['issue', number]); return { number, title: 'Fix', body: 'body', state: 'OPEN', assignees: [], labels: REQUIRED_LABELS }; },
     async listIssues() { return []; },
     async clone(name, directory) { calls.push(['clone', directory]); },
     async getPushRemote() { calls.push(['permission']); return { canPush: true, remoteName: 'origin' }; },
@@ -29,13 +45,88 @@ function setup({ verificationExitCode = 0 } = {}) {
       if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: ' M src/app.js\n', stderr: '' };
       if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
       if (command === 'git' && args[0] === 'diff') return { exitCode: 0, stdout: '', stderr: '' };
-      if (command === 'npm') return { exitCode: verificationExitCode, stdout: '', stderr: '' };
+      if (command === APPROVED_CONFIG.verifyCommand[0]) return { exitCode: verificationExitCode, stdout: '', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };
     },
   };
   const codex = { async implement() { calls.push(['codex']); } };
-  return { store, repository, calls, github, runner, codex };
+  return { store, repository, calls, github, runner, codex, approvedTimeoutMs: APPROVED_TIMEOUT_MS };
 }
+
+test('workflow rejects legacy, malformed, and mismatched approvals before external side effects', async () => {
+  const cases = [
+    { policy: {}, verificationArgv: APPROVED_CONFIG.verifyCommand },
+    { policy: { approvedConfig: { ...APPROVED_CONFIG, timeoutMinutes: 0 } }, verificationArgv: APPROVED_CONFIG.verifyCommand },
+    { policy: { approvedConfig: APPROVED_CONFIG }, verificationArgv: ['node', '--version'] },
+  ];
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  for (const value of cases) {
+    const setupState = setup();
+    setupState.store.db.prepare('UPDATE repositories SET policy_json = ?, verification_argv = ? WHERE id = ?')
+      .run(JSON.stringify(value.policy), JSON.stringify(value.verificationArgv), setupState.repository.id);
+    const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'must-not-run', cleanup: async () => {} });
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+      error => error.code === 'REPOSITORY_REAPPROVAL_REQUIRED' && /repo add.*--config/i.test(error.message),
+    );
+    assert.deepEqual(setupState.calls, []);
+    assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+    setupState.store.close();
+  }
+});
+
+test('workflow rejects a runtime timeout that does not match the approved timeout before side effects', async () => {
+  const setupState = setup();
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    approvedTimeoutMs: 1_000,
+    tempDirectoryFactory: async () => 'must-not-run',
+    cleanup: async () => {},
+  });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    error => error.code === 'REPOSITORY_REAPPROVAL_REQUIRED',
+  );
+  assert.deepEqual(setupState.calls, []);
+  assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+  setupState.store.close();
+});
+
+test('workflow claim transaction rejects a concurrent two-connection reapproval before executing old policy', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'patchpool-workflow-approval-race-'));
+  const path = join(directory, 'state.sqlite');
+  const setupState = setup({ storePath: path });
+  const approvingStore = PatchPoolStore.open(path);
+  const nextApprovedConfig = { ...APPROVED_CONFIG, timeoutMinutes: 31 };
+  setupState.github.getIssue = async (name, number) => {
+    setupState.calls.push(['issue', number]);
+    approvingStore.reapproveRepository({
+      fullName: name,
+      configDigest: digestApprovedRepositoryConfig(nextApprovedConfig),
+      verificationArgv: [...nextApprovedConfig.verifyCommand],
+      requiredLabel: nextApprovedConfig.requiredIssueLabel,
+      policy: { approvedConfig: nextApprovedConfig },
+      public: true,
+      active: true,
+    });
+    return { number, title: 'Fix', body: 'body', state: 'OPEN', assignees: [], labels: REQUIRED_LABELS };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'must-not-run', cleanup: async () => {} });
+  try {
+    await assert.rejects(
+      () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+      error => error.code === 'REPOSITORY_APPROVAL_CHANGED',
+    );
+    assert.equal(setupState.store.db.prepare('SELECT COUNT(*) AS count FROM claims').get().count, 0);
+    assert.equal(setupState.calls.some(call => ['clone', 'codex'].includes(call[0])), false);
+  } finally {
+    approvingStore.close();
+    setupState.store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('dry-run claims only after eligibility, runs Codex, and never commits, pushes, or creates a PR', async () => {
   const setupState = setup();
@@ -62,6 +153,61 @@ test('failed approved verification does not commit', async () => {
   const failed = setupState.store.db.prepare('SELECT fields_json FROM claims ORDER BY id DESC LIMIT 1').get();
   assert.equal(JSON.parse(failed.fields_json).error, undefined);
   assert.equal(JSON.parse(failed.fields_json).errorCode, 'WORKFLOW_VERIFICATION_FAILED');
+  setupState.store.close();
+});
+
+test('one approved timeout bounds both Codex and a hanging verification command', async () => {
+  const setupState = setup();
+  let codexTimeoutMs;
+  let verificationOptions;
+  setupState.codex.implement = async input => { codexTimeoutMs = input.timeoutMs; };
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === APPROVED_CONFIG.verifyCommand[0]) {
+      verificationOptions = options;
+      return new Promise((resolve, reject) => {
+        setImmediate(() => reject(Object.assign(new Error('simulated bounded timeout'), { code: 'COMMAND_TIMEOUT' })));
+      });
+    }
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    approvedTimeoutMs: APPROVED_TIMEOUT_MS,
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {},
+  });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    error => error.code === 'WORKFLOW_VERIFICATION_FAILED',
+  );
+  assert.equal(codexTimeoutMs, APPROVED_TIMEOUT_MS);
+  assert.equal(verificationOptions.timeoutMs, APPROVED_TIMEOUT_MS);
+  setupState.store.close();
+});
+
+test('a hanging clone receives the lease signal and the smaller approved/external timeout', async () => {
+  const setupState = setup();
+  let cloneOptions;
+  setupState.github.clone = async (name, directory, options) => {
+    cloneOptions = options;
+    return new Promise((resolve, reject) => {
+      setImmediate(() => reject(new Error('simulated hanging clone timeout')));
+    });
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    externalOperationTimeoutMs: 12_345,
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {},
+  });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }));
+  assert.ok(cloneOptions.signal instanceof AbortSignal);
+  assert.equal(cloneOptions.signal.aborted, false);
+  assert.equal(cloneOptions.timeoutMs, 12_345);
+  assert.equal(setupState.calls.some(call => call[0] === 'codex'), false);
   setupState.store.close();
 });
 
@@ -120,7 +266,7 @@ test('ambiguous PR creation reconciles the existing matching Draft PR without re
 
 test('rejects a pull-request-shaped issue before cloning or claiming', async () => {
   const setupState = setup();
-  setupState.github.getIssue = async () => ({ number: 1, title: 'PR', state: 'OPEN', assignees: [], labels: [], pull_request: { url: 'https://github.com/octo/example/pull/1' } });
+  setupState.github.getIssue = async () => ({ number: 1, title: 'PR', state: 'OPEN', assignees: [], labels: REQUIRED_LABELS, pull_request: { url: 'https://github.com/octo/example/pull/1' } });
   const { IssueWorkflow } = await import('../src/workflow.js');
   const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_PULL_REQUEST');
@@ -136,7 +282,7 @@ test('rejects verification that mutates the same changed path', async () => {
     setupState.calls.push(['run', command, args]);
     if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: ' M src/app.js\0', stderr: '' };
     if (command === 'git' && args[0] === 'diff') return { exitCode: 0, stdout: '', stderr: '' };
-    if (command === 'npm') {
+    if (command === APPROVED_CONFIG.verifyCommand[0]) {
       await mkdir(join(directory, 'src'), { recursive: true });
       await writeFile(join(directory, 'src', 'app.js'), 'mutated');
       return { exitCode: 0, stdout: '', stderr: '' };
@@ -183,7 +329,7 @@ test('rejects a rename record whose destination is a secret path', async () => {
 
 test('resumes a pushed claim by reconciling its PR without running Codex or pushing again', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc' });
@@ -215,7 +361,7 @@ test('strips credential environment variables while preserving Codex operational
   setupState.codex.implement = async options => { codexEnvironment = options.env; };
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
-    if (command === 'npm') verifierEnvironment = options.env;
+    if (command === APPROVED_CONFIG.verifyCommand[0]) verifierEnvironment = options.env;
     if (command === 'git' && args[0] === '-c' && args.includes('push')) pushEnvironment = options.env;
     return originalRun(command, args, options);
   };
@@ -261,7 +407,7 @@ test('surfaces cleanup failure as a stable workflow error', async () => {
 
 test('committed resume reuses a matching workspace without cloning', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'worktree' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'worktree' });
@@ -282,7 +428,7 @@ test('committed resume reuses a matching workspace without cloning', async () =>
 
 test('committed resume with an unusable workspace restarts from running in a fresh directory', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree' });
   setupState.store.transitionClaim(claim.id, 'verified');
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'missing-worktree' });
@@ -292,7 +438,7 @@ test('committed resume with an unusable workspace restarts from running in a fre
     setupState.calls.push(['run', command, args]);
     if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
     if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 1, stdout: '', stderr: '' };
-    return { exitCode: 0, stdout: command === 'npm' ? '' : ' M src/app.js\n', stderr: '' };
+    return { exitCode: 0, stdout: command === APPROVED_CONFIG.verifyCommand[0] ? '' : ' M src/app.js\n', stderr: '' };
   };
   const { IssueWorkflow } = await import('../src/workflow.js');
   const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'fresh-worktree', cleanup: async () => {} });
@@ -367,7 +513,7 @@ test('execution lease prevents concurrent same-worker workflows from running Cod
 
 test('restart from a non-reusable committed claim clears stage-specific metadata', async () => {
   const setupState = setup();
-  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a', expectedConfigDigest: setupState.repository.configDigest });
   setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree', startedAt: 'old-start', errorCode: 'old-error' });
   setupState.store.transitionClaim(claim.id, 'verified', { verifiedAt: 'old-verify' });
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'old-sha', committedAt: 'old-time', workspace: 'missing-worktree' });
@@ -458,7 +604,7 @@ test('a workflow that loses its lease after Codex cannot verify or overwrite the
   );
   const claim = setupState.store.getClaim(capturedLease.claimId);
   assert.equal(claim.state, 'running');
-  assert.equal(setupState.calls.some(call => call[0] === 'run' && call[1] === 'npm'), false);
+  assert.equal(setupState.calls.some(call => call[0] === 'run' && call[1] === APPROVED_CONFIG.verifyCommand[0]), false);
   setupState.store.close();
 });
 

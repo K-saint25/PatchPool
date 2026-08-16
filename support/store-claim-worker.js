@@ -7,7 +7,7 @@ try {
   const waiting = Atomics.add(barrier, 0, 1) + 1;
   Atomics.notify(barrier, 0);
   while (Atomics.load(barrier, 0) < 2) Atomics.wait(barrier, 0, waiting - 1);
-  const claim = store.claimIssue({ repoId: workerData.repoId, issueNumber: 7, workerId: workerData.workerId });
+  const claim = store.claimIssue({ repoId: workerData.repoId, issueNumber: 7, workerId: workerData.workerId, expectedConfigDigest: workerData.expectedConfigDigest });
   parentPort.postMessage({ ok: true, id: claim.id });
 } catch (error) {
   parentPort.postMessage({ ok: false, code: error.code, message: error.message });

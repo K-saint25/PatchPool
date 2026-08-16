@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.patchpool.sqlite*
 *.pem
 *.key
 auth.json

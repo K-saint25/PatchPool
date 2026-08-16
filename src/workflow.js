@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { PatchPoolError } from './errors.js';
 import { evaluateIssueEligibility } from './policy.js';
 import { buildImplementationPrompt } from './prompt.js';
+import { assertRepositoryApproval } from './config.js';
 import { resolveWorkerId } from './worker.js';
 
 const SECRET_FILE = /(?:^|[\\/])(?:\.env(?:\.|$)|\.ssh(?:[\\/]|$)|\.aws(?:[\\/]|$)|\.git-credentials(?:\.|$)|.*\.(?:pem|key|p12|pfx)|.*id_(?:rsa|ecdsa|ed25519)(?:\.|$)|.*private[_-]?key.*|.*credentials?(?:\.|$)|.*secrets?(?:\.|$)|.*token.*)|(?:^|[\\/])\.\.(?:[\\/]|$)/i;
@@ -131,7 +132,7 @@ export class IssueWorkflow {
     clock = () => new Date().toISOString(),
     randomId = randomUUID,
     promptBuilder = buildImplementationPrompt,
-    codexTimeoutMs,
+    approvedTimeoutMs,
     filesystem = defaultFilesystem,
     environment = process.env,
     hooksDirectoryFactory = defaultTempDirectoryFactory,
@@ -159,7 +160,10 @@ export class IssueWorkflow {
     this.clock = clock;
     this.randomId = randomId;
     this.promptBuilder = promptBuilder;
-    this.codexTimeoutMs = codexTimeoutMs;
+    if (approvedTimeoutMs !== undefined && (!Number.isFinite(approvedTimeoutMs) || approvedTimeoutMs <= 0)) {
+      throw new TypeError('IssueWorkflow requires a positive approved operation timeout');
+    }
+    this.approvedTimeoutMs = approvedTimeoutMs;
     this.filesystem = filesystem;
     this.environment = environment;
     this.hooksDirectoryFactory = hooksDirectoryFactory;
@@ -409,6 +413,7 @@ export class IssueWorkflow {
     if (!approved) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${fullName}`);
     if (!approved.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${fullName}`);
     if (!approved.public) throw new PatchPoolError('REPOSITORY_NOT_PUBLIC', `Repository is not public: ${fullName}`);
+    assertRepositoryApproval(approved, { approvedTimeoutMs: this.approvedTimeoutMs });
 
     let claim;
     let workspace;
@@ -431,7 +436,12 @@ export class IssueWorkflow {
         if (!issue) throw new PatchPoolError('WORKFLOW_NO_ELIGIBLE_ISSUE', 'No eligible issue is available');
       }
       const number = issueNumber(issue, requestedIssueNumber);
-      claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId });
+      claim = this.store.claimIssue({
+        repoId: approved.id,
+        issueNumber: number,
+        workerId: this.workerId,
+        expectedConfigDigest: approved.configDigest,
+      });
       if (typeof this.store.acquireExecutionLease === 'function') {
         const lease = this.store.acquireExecutionLease(claim.id, this.workerId, {
           ttlMs: this.leaseTtlMs,
@@ -460,21 +470,22 @@ export class IssueWorkflow {
       if (!workspace) workspace = await this.withLease(leaseController, () => this.tempDirectoryFactory(`patchpool-${number}-${String(claim.id ?? this.randomId())}-`));
       if (!reuseCommitted) {
         await this.ensureEmptyWorkspace(workspace);
-        await this.withLease(leaseController, () => this.github.clone(fullName, workspace));
+        const cloneTimeoutMs = Math.min(this.approvedTimeoutMs, this.externalOperationTimeoutMs);
+        await this.withLease(leaseController, signal => this.github.clone(fullName, workspace, { signal, timeoutMs: cloneTimeoutMs }));
         await this.withLease(leaseController, () => this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch'));
         if (claim.state === 'claimed' || claim.state === 'running') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() }, leaseController);
       }
 
       if (claim.state !== 'committed') {
         const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
-        await this.withLease(leaseController, () => this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs, env: sanitizeEnvironment(this.environment) }));
+        await this.withLease(leaseController, () => this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.approvedTimeoutMs, env: sanitizeEnvironment(this.environment) }));
         const afterCodex = await this.status(workspace);
         if (afterCodex.paths.length === 0) throw new PatchPoolError('WORKFLOW_NO_CHANGES', 'Codex produced no worktree changes');
         const beforeVerification = await this.fingerprint(workspace, afterCodex);
         await this.invoke('git', ['diff', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Git diff check failed');
         const verification = [...approved.verificationArgv];
         if (!verification.length || verification.some(argument => typeof argument !== 'string' || !argument)) throw new PatchPoolError('WORKFLOW_INVALID_VERIFICATION', 'Repository verification argv is invalid');
-        await this.withLease(leaseController, () => this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed'));
+        await this.withLease(leaseController, () => this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment), timeoutMs: this.approvedTimeoutMs }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed'));
         const afterVerification = await this.status(workspace);
         const afterFingerprint = await this.fingerprint(workspace, afterVerification);
         if (!sameSet(new Set(beforeVerification.keys()), new Set(afterFingerprint.keys())) || [...beforeVerification].some(([path, digest]) => afterFingerprint.get(path) !== digest)) throw new PatchPoolError('WORKFLOW_VERIFICATION_MUTATED', 'Verification changed the worktree');

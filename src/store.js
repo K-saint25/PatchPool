@@ -23,7 +23,7 @@ function now() {
 
 function canonicalFullName(fullName) {
   const value = String(fullName ?? '').trim();
-  if (!/^[^/\s]+\/[^/\s]+$/.test(value)) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) {
     throw new PatchPoolError('INVALID_REPOSITORY', 'Repository must use the owner/name form');
   }
   return value;
@@ -40,6 +40,31 @@ function json(value, fallback) {
 function booleanValue(value, fallback) {
   if (value === undefined || value === null) return fallback;
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function normalizeRepository(input) {
+  if (!input || !input.configDigest) {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Repository configDigest is required');
+  }
+  const publicRepository = booleanValue(input.public ?? input.isPublic, true);
+  if (!publicRepository || String(input.visibility ?? '').toLowerCase() === 'private') {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
+  }
+  const fullName = canonicalFullName(input.fullName);
+  if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
+      input.verificationArgv.some(argument => typeof argument !== 'string' || argument.length === 0)) {
+    throw new PatchPoolError('INVALID_REPOSITORY', 'Repository verificationArgv must be a non-empty string array');
+  }
+  return {
+    fullName,
+    active: booleanValue(input.active, true),
+    public: publicRepository,
+    configDigest: String(input.configDigest),
+    verificationArgv: input.verificationArgv,
+    requiredLabel: input.requiredLabel ?? input.policy?.requiredLabel ?? null,
+    blockingLabels: input.blockingLabels ?? input.policy?.blockingLabels ?? [],
+    policy: input.policy ?? {},
+  };
 }
 
 function mapRepository(row) {
@@ -228,6 +253,7 @@ export class PatchPoolStore {
   }
 
   constructor(path, { clock = Date.now, randomId = randomUUID, isOwnerAlive = processIsAlive, ownerSessionId = randomUUID() } = {}) {
+    this.path = path;
     this.clock = clock;
     this.randomId = randomId;
     this.isOwnerAlive = isOwnerAlive;
@@ -289,21 +315,8 @@ export class PatchPoolStore {
   }
 
   registerRepository(input) {
-    if (!input || !input.configDigest) {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Repository configDigest is required');
-    }
-    if (input.public === false || input.isPublic === false || String(input.visibility ?? '').toLowerCase() === 'private') {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Only public repositories may be registered');
-    }
-    const fullName = canonicalFullName(input.fullName);
-    if (!Array.isArray(input.verificationArgv) || input.verificationArgv.length === 0 ||
-        input.verificationArgv.some(argument => typeof argument !== 'string' || argument.length === 0)) {
-      throw new PatchPoolError('INVALID_REPOSITORY', 'Repository verificationArgv must be a non-empty string array');
-    }
+    const repository = normalizeRepository(input);
     const timestamp = now();
-    const requiredLabel = input.requiredLabel ?? input.policy?.requiredLabel ?? null;
-    const blockingLabels = input.blockingLabels ?? input.policy?.blockingLabels ?? [];
-    const policy = input.policy ?? {};
     try {
       const result = this.db.prepare(`
         INSERT INTO repositories
@@ -311,24 +324,57 @@ export class PatchPoolStore {
            required_label, blocking_labels, policy_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        fullName,
-        booleanValue(input.active, true) ? 1 : 0,
-        booleanValue(input.public ?? input.isPublic, true) ? 1 : 0,
-        String(input.configDigest),
-        JSON.stringify(input.verificationArgv),
-        requiredLabel,
-        JSON.stringify(Array.isArray(blockingLabels) ? blockingLabels : []),
-        JSON.stringify(policy),
+        repository.fullName,
+        repository.active ? 1 : 0,
+        repository.public ? 1 : 0,
+        repository.configDigest,
+        JSON.stringify(repository.verificationArgv),
+        repository.requiredLabel,
+        JSON.stringify(Array.isArray(repository.blockingLabels) ? repository.blockingLabels : []),
+        JSON.stringify(repository.policy),
         timestamp,
         timestamp,
       );
       return this.getRepositoryById(Number(result.lastInsertRowid));
     } catch (error) {
       if (String(error?.code ?? '').includes('CONSTRAINT') || /UNIQUE constraint/i.test(error?.message ?? '')) {
-        throw new PatchPoolError('REPOSITORY_EXISTS', `Repository is already registered: ${fullName}`);
+        throw new PatchPoolError('REPOSITORY_EXISTS', `Repository is already registered: ${repository.fullName}`);
       }
       throw error;
     }
+  }
+
+  reapproveRepository(input) {
+    const repository = normalizeRepository(input);
+    return withImmediateTransaction(this.db, () => {
+      const existing = this.db.prepare('SELECT * FROM repositories WHERE full_name = ? COLLATE NOCASE').get(repository.fullName);
+      if (!existing) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Repository is not registered: ${repository.fullName}`);
+      const activeClaim = this.db.prepare(`
+        SELECT id FROM claims
+        WHERE repo_id = ? AND state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened')
+        LIMIT 1
+      `).get(existing.id);
+      if (activeClaim) {
+        throw new PatchPoolError('REPOSITORY_REAPPROVAL_BUSY', 'Repository approval cannot change while a claim is active');
+      }
+      this.db.prepare(`
+        UPDATE repositories
+        SET full_name = ?, active = ?, is_public = ?, config_digest = ?, verification_argv = ?,
+            required_label = ?, policy_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        repository.fullName,
+        repository.active ? 1 : 0,
+        repository.public ? 1 : 0,
+        repository.configDigest,
+        JSON.stringify(repository.verificationArgv),
+        repository.requiredLabel,
+        JSON.stringify(repository.policy),
+        now(),
+        existing.id,
+      );
+      return this.getRepositoryById(existing.id);
+    });
   }
 
   getRepositoryById(id) {
@@ -347,26 +393,34 @@ export class PatchPoolStore {
     const repoId = Number(input?.repoId);
     const issueNumber = Number(input?.issueNumber);
     const workerId = String(input?.workerId ?? '').trim();
-    if (!Number.isInteger(repoId) || repoId < 1 || !Number.isInteger(issueNumber) || issueNumber < 1 || !workerId) {
-      throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, and workerId are required');
+    const expectedConfigDigest = String(input?.expectedConfigDigest ?? '').trim();
+    if (!Number.isInteger(repoId) || repoId < 1 || !Number.isInteger(issueNumber) || issueNumber < 1 || !workerId || !expectedConfigDigest) {
+      throw new PatchPoolError('INVALID_CLAIM', 'repoId, positive issueNumber, workerId, and expectedConfigDigest are required');
     }
     return withImmediateTransaction(this.db, () => {
       const repository = this.getRepositoryById(repoId);
       if (!repository) throw new PatchPoolError('REPOSITORY_NOT_FOUND', `Unknown repository id: ${repoId}`);
       if (!repository.active) throw new PatchPoolError('REPOSITORY_INACTIVE', `Repository is inactive: ${repository.fullName}`);
       if (!repository.public) throw new PatchPoolError('REPOSITORY_NOT_PUBLIC', `Repository is not public: ${repository.fullName}`);
+      if (repository.configDigest !== expectedConfigDigest) {
+        throw new PatchPoolError('REPOSITORY_APPROVAL_CHANGED', 'Repository approval changed before the claim transaction');
+      }
       const existing = this.db.prepare(`SELECT * FROM claims WHERE repo_id = ? AND issue_number = ? AND state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened')`).get(repoId, issueNumber);
       if (existing) {
         const mapped = mapClaim(existing);
+        if (mapped.approvalConfigDigest !== expectedConfigDigest) {
+          throw new PatchPoolError('REPOSITORY_APPROVAL_CHANGED', 'Active claim belongs to another repository approval generation');
+        }
         if (mapped.workerId === workerId) return mapped;
         throw new PatchPoolError('CLAIM_EXISTS', `Issue ${issueNumber} already has an active claim`);
       }
       const timestamp = now();
+      const fields = { ...(input.fields ?? {}), approvalConfigDigest: expectedConfigDigest };
       try {
         const result = this.db.prepare(`
           INSERT INTO claims (repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
           VALUES (?, ?, ?, 'claimed', ?, ?, ?)
-        `).run(repoId, issueNumber, workerId, JSON.stringify(input.fields ?? {}), timestamp, timestamp);
+        `).run(repoId, issueNumber, workerId, JSON.stringify(fields), timestamp, timestamp);
         const claim = this.getClaim(Number(result.lastInsertRowid));
         this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
           .run(claim.id, 'claimed', JSON.stringify({ workerId }), timestamp);
@@ -411,7 +465,9 @@ export class PatchPoolStore {
     if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
       throw new PatchPoolError('INVALID_TRANSITION', 'Transition fields must be an object');
     }
-    const merged = { ...json(current.fields_json, {}), ...fields };
+    const currentFields = json(current.fields_json, {});
+    const merged = { ...currentFields, ...fields };
+    if (Object.hasOwn(currentFields, 'approvalConfigDigest')) merged.approvalConfigDigest = currentFields.approvalConfigDigest;
     const timestamp = now();
     this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
       .run(state, JSON.stringify(merged), timestamp, claimId);
@@ -447,8 +503,10 @@ export class PatchPoolStore {
     if (!current) throw new PatchPoolError('CLAIM_NOT_FOUND', `Unknown claim id: ${claimId}`);
     if (current.state !== 'committed') throw new PatchPoolError('INVALID_TRANSITION', `Cannot restart claim from ${current.state}`);
     const merged = { ...json(current.fields_json, {}) };
+    const approvalConfigDigest = merged.approvalConfigDigest;
     for (const key of ['commitSha', 'committedAt', 'verifiedAt', 'workspace', 'pushedAt', 'prUrl', 'openedAt', 'errorCode', 'failedAt', 'startedAt', 'restartAt']) delete merged[key];
     Object.assign(merged, fields);
+    if (approvalConfigDigest !== undefined) merged.approvalConfigDigest = approvalConfigDigest;
     const timestamp = now();
     this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
       .run('running', JSON.stringify(merged), timestamp, claimId);

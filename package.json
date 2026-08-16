@@ -9,7 +9,19 @@
   "bin": {
     "patchpool": "bin/patchpool.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/architecture/",
+    ".patchpool.json",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "check:package": "node support/check-package-tarball.js"
   }
 }
