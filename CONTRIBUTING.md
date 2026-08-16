@@ -13,7 +13,7 @@ credential boundary and the fail-safe workflow described in
 4. Update operator documentation when CLI behavior or recovery changes.
 
 Pull requests should link the relevant issue, describe the security impact,
-and include exact test or verification commands. CI covers Node 24 on Windows
+and include exact test or verification commands. The checked-in CI template covers Node 24 on Windows
 and Ubuntu.
 
 ## Safety requirements
