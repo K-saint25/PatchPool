@@ -10,18 +10,41 @@ function memoryStore() {
   return PatchPoolStore.open(':memory:');
 }
 
+function writeApprovedConfig(directory, verifyCommand = [process.execPath, '--test']) {
+  const configPath = join(directory, '.patchpool.json');
+  writeFileSync(configPath, JSON.stringify({
+    verifyCommand,
+    requiredIssueLabel: 'patchpool-ready',
+    timeoutMinutes: 30,
+  }));
+  return configPath;
+}
+
+function eligibleGitHub(calls = []) {
+  return {
+    async getRepository(fullName) {
+      calls.push(fullName);
+      return { fullName, public: true, archived: false, defaultBranch: 'main' };
+    },
+  };
+}
+
 test('repo add registers an approved repository and reports JSON', async () => {
   const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-add-'));
+  const configPath = writeApprovedConfig(directory);
   const output = [];
   try {
-    const result = await main([
-      'repo', 'add', '--repo', 'octo/example', '--config-digest', 'sha256:one',
-      '--verification-argv', '["npm","test"]', '--required-label', 'patchpool-ready',
-    ], { store, stdout: value => output.push(value) });
+    const result = await main(['repo', 'add', '--repo', 'octo/example', '--config', configPath], {
+      store,
+      github: eligibleGitHub(),
+      stdout: value => output.push(value),
+    });
     assert.equal(result.fullName, 'octo/example');
     assert.deepEqual(JSON.parse(output.join('')), { ...result });
   } finally {
     store.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -37,6 +60,7 @@ test('repo add loads and persists an approved config snapshot without a caller-p
   try {
     const result = await main(['repo', 'add', '--repo', 'octo/configured', '--config', configPath], {
       store,
+      github: eligibleGitHub(),
       stdout() {},
     });
     assert.match(result.configDigest, /^sha256:[a-f0-9]{64}$/);
@@ -54,13 +78,73 @@ test('repo add loads and persists an approved config snapshot without a caller-p
   }
 });
 
-test('repo add defaults verification to the Windows-safe Node test executable', async () => {
+test('repo add defaults to the repository cwd .patchpool.json without caller approval fields', async () => {
   const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-default-config-'));
+  writeApprovedConfig(directory);
   try {
-    const result = await main(['repo', 'add', '--repo', 'octo/default', '--config-digest', 'sha256:one'], { store, stdout() {} });
+    const result = await main(['repo', 'add', '--repo', 'octo/default'], {
+      store,
+      cwd: directory,
+      github: eligibleGitHub(),
+      stdout() {},
+    });
     assert.deepEqual(result.verificationArgv, [process.execPath, '--test']);
   } finally {
     store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo add rejects legacy caller-provided digest and verification argv approval bypasses', async () => {
+  const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-legacy-config-'));
+  const configPath = writeApprovedConfig(directory);
+  const calls = [];
+  try {
+    for (const legacyOption of [
+      ['--config-digest', 'sha256:caller'],
+      ['--verification-argv', '["node","--test"]'],
+    ]) {
+      await assert.rejects(
+        () => main([
+          'repo', 'add', '--repo', 'octo/legacy', '--config', configPath, ...legacyOption,
+        ], { store, github: eligibleGitHub(calls), stdout() {} }),
+        error => error.code === 'INVALID_ARGS',
+      );
+    }
+    assert.deepEqual(calls, []);
+    assert.equal(store.listRepositories().length, 0);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repo add verifies the exact canonical public non-archived repository before persistence', async () => {
+  const store = memoryStore();
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-cli-remote-approval-'));
+  const configPath = writeApprovedConfig(directory);
+  const calls = [];
+  try {
+    await assert.rejects(
+      () => main(['repo', 'add', '--repo', 'octo/rejected', '--config', configPath], {
+        store,
+        github: {
+          async getRepository(fullName) {
+            calls.push(fullName);
+            throw Object.assign(new Error('not canonical public active'), { code: 'GITHUB_REPOSITORY_INELIGIBLE' });
+          },
+        },
+        stdout() {},
+      }),
+      error => error.code === 'GITHUB_REPOSITORY_INELIGIBLE',
+    );
+    assert.deepEqual(calls, ['octo/rejected']);
+    assert.equal(store.listRepositories().length, 0);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -134,7 +218,7 @@ test('repo add rejects the private-registration path', async () => {
   const store = memoryStore();
   try {
     await assert.rejects(
-      () => main(['repo', 'add', '--repo', 'octo/private', '--private', '--config-digest', 'sha256:one'], { store, stdout() {} }),
+      () => main(['repo', 'add', '--repo', 'octo/private', '--private'], { store, stdout() {} }),
       error => error.code === 'INVALID_ARGS',
     );
   } finally {

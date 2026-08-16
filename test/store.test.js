@@ -43,6 +43,23 @@ test('registers one canonical repository and persists its approval snapshot', ()
   }
 });
 
+test('repository names use the same canonical owner/name grammar as the GitHub adapter', () => {
+  const { store, directory } = openTempStore();
+  try {
+    for (const fullName of ['owner name/repo', 'owner/repo name', 'owner/repo?', '@owner/repo', 'owner//repo']) {
+      assert.throws(
+        () => store.registerRepository(approvedRepo({ fullName })),
+        error => error.code === 'INVALID_REPOSITORY',
+      );
+    }
+    const accepted = store.registerRepository(approvedRepo({ fullName: 'owner.name/repo_name-1' }));
+    assert.equal(accepted.fullName, 'owner.name/repo_name-1');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('persists the approval snapshot across close and reopen', () => {
   const { store, path, directory } = openTempStore();
   try {

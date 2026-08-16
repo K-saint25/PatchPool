@@ -131,7 +131,7 @@ export class IssueWorkflow {
     clock = () => new Date().toISOString(),
     randomId = randomUUID,
     promptBuilder = buildImplementationPrompt,
-    codexTimeoutMs,
+    approvedTimeoutMs,
     filesystem = defaultFilesystem,
     environment = process.env,
     hooksDirectoryFactory = defaultTempDirectoryFactory,
@@ -159,7 +159,10 @@ export class IssueWorkflow {
     this.clock = clock;
     this.randomId = randomId;
     this.promptBuilder = promptBuilder;
-    this.codexTimeoutMs = codexTimeoutMs;
+    if (approvedTimeoutMs !== undefined && (!Number.isFinite(approvedTimeoutMs) || approvedTimeoutMs <= 0)) {
+      throw new TypeError('IssueWorkflow requires a positive approved operation timeout');
+    }
+    this.approvedTimeoutMs = approvedTimeoutMs;
     this.filesystem = filesystem;
     this.environment = environment;
     this.hooksDirectoryFactory = hooksDirectoryFactory;
@@ -467,14 +470,14 @@ export class IssueWorkflow {
 
       if (claim.state !== 'committed') {
         const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
-        await this.withLease(leaseController, () => this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs, env: sanitizeEnvironment(this.environment) }));
+        await this.withLease(leaseController, () => this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.approvedTimeoutMs, env: sanitizeEnvironment(this.environment) }));
         const afterCodex = await this.status(workspace);
         if (afterCodex.paths.length === 0) throw new PatchPoolError('WORKFLOW_NO_CHANGES', 'Codex produced no worktree changes');
         const beforeVerification = await this.fingerprint(workspace, afterCodex);
         await this.invoke('git', ['diff', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Git diff check failed');
         const verification = [...approved.verificationArgv];
         if (!verification.length || verification.some(argument => typeof argument !== 'string' || !argument)) throw new PatchPoolError('WORKFLOW_INVALID_VERIFICATION', 'Repository verification argv is invalid');
-        await this.withLease(leaseController, () => this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed'));
+        await this.withLease(leaseController, () => this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment), timeoutMs: this.approvedTimeoutMs }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed'));
         const afterVerification = await this.status(workspace);
         const afterFingerprint = await this.fingerprint(workspace, afterVerification);
         if (!sameSet(new Set(beforeVerification.keys()), new Set(afterFingerprint.keys())) || [...beforeVerification].some(([path, digest]) => afterFingerprint.get(path) !== digest)) throw new PatchPoolError('WORKFLOW_VERIFICATION_MUTATED', 'Verification changed the worktree');

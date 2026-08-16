@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { PatchPoolStore } from '../src/store.js';
 import { main } from '../src/cli.js';
 
@@ -38,13 +42,22 @@ function authenticatedDependencies(calls = []) {
   };
 }
 
-test('doctor --json reports Node, auth, Git identity, state DB, and intentionally disabled signing', async () => {
-  const store = memoryStore();
+function fileDigest(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+test('doctor inspects an existing state database read-only without creating or migrating schema', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-existing-'));
+  const dbPath = join(directory, 'state.sqlite');
+  const database = new DatabaseSync(dbPath);
+  database.exec("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('unchanged')");
+  database.close();
+  const before = fileDigest(dbPath);
   const calls = [];
   const output = [];
   try {
     const result = await main(['doctor', '--json'], {
-      store,
+      dbPath,
       nodeVersion: '24.15.0',
       ...authenticatedDependencies(calls),
       stdout: value => output.push(value),
@@ -60,7 +73,14 @@ test('doctor --json reports Node, auth, Git identity, state DB, and intentionall
       name: 'Patch Pool Operator',
       email: 'operator@example.test',
     });
-    assert.deepEqual(result.checks.stateDatabase, { ok: true, path: ':memory:', writable: true, openable: true });
+    assert.deepEqual(result.checks.stateDatabase, {
+      ok: true,
+      path: dbPath,
+      exists: true,
+      writable: true,
+      openable: true,
+      integrity: 'ok',
+    });
     assert.deepEqual(result.checks.commitSigning, {
       ok: true,
       enabled: false,
@@ -73,35 +93,101 @@ test('doctor --json reports Node, auth, Git identity, state DB, and intentionall
       ['git', 'config', '--get', 'user.name'],
       ['git', 'config', '--get', 'user.email'],
     ]);
-    assert.equal(store.listRepositories().length, 0);
+    assert.equal(fileDigest(dbPath), before);
+    const inspected = new DatabaseSync(dbPath, { readOnly: true });
+    assert.deepEqual(inspected.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map(row => row.name), ['sentinel']);
+    inspected.close();
   } finally {
-    store.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test('doctor reports all failed checks with a nonzero suggested exit code', async () => {
-  const store = memoryStore();
+test('doctor validates a missing state path through its parent without creating the database', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-missing-'));
+  const dbPath = join(directory, 'state.sqlite');
+  try {
+    const result = await main(['doctor', '--json'], {
+      dbPath,
+      nodeVersion: '24.15.0',
+      ...authenticatedDependencies(),
+      stdout() {},
+    });
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(result.checks.stateDatabase, {
+      ok: true,
+      path: dbPath,
+      exists: false,
+      writable: true,
+      openable: true,
+      creatable: true,
+    });
+    assert.equal(existsSync(dbPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('doctor aggregates an invalid state parent instead of throwing or creating it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-parent-'));
+  const missingParent = join(directory, 'missing-parent');
+  const dbPath = join(missingParent, 'state.sqlite');
   const output = [];
   try {
     const result = await main(['doctor', '--json'], {
-      store,
-      dbPath: ':memory:',
-      nodeVersion: '23.9.0',
-      github: { async preflight() { throw Object.assign(new Error('no gh auth'), { code: 'GITHUB_COMMAND_FAILED' }); } },
-      codex: { async preflight() { throw Object.assign(new Error('API key is not eligible'), { code: 'CODEX_AUTH_REQUIRED' }); } },
-      runner: { async run() { return { exitCode: 1, stdout: '', stderr: '' }; } },
+      dbPath,
+      nodeVersion: '24.15.0',
+      ...authenticatedDependencies(),
       stdout: value => output.push(value),
     });
     assert.equal(result.ok, false);
     assert.equal(result.exitCode, 1);
-    assert.equal(result.checks.node.ok, false);
-    assert.equal(result.checks.github.code, 'GITHUB_COMMAND_FAILED');
-    assert.equal(result.checks.codex.code, 'CODEX_AUTH_REQUIRED');
-    assert.equal(result.checks.gitIdentity.ok, false);
-    assert.equal(result.checks.stateDatabase.ok, true);
-    assert.equal(JSON.parse(output.join('')).ok, false);
+    assert.equal(result.checks.stateDatabase.ok, false);
+    assert.equal(result.checks.stateDatabase.code, 'STATE_DATABASE_PARENT_UNAVAILABLE');
+    assert.deepEqual(JSON.parse(output.join('')), result);
+    assert.equal(existsSync(missingParent), false);
   } finally {
-    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('doctor reports all failed checks with a nonzero suggested exit code', async () => {
+  const output = [];
+  const result = await main(['doctor', '--json'], {
+    dbPath: ':memory:',
+    nodeVersion: '23.9.0',
+    github: { async preflight() { throw Object.assign(new Error('no gh auth'), { code: 'GITHUB_COMMAND_FAILED' }); } },
+    codex: { async preflight() { throw Object.assign(new Error('API key is not eligible'), { code: 'CODEX_AUTH_REQUIRED' }); } },
+    runner: { async run() { return { exitCode: 1, stdout: '', stderr: '' }; } },
+    stdout: value => output.push(value),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.checks.node.ok, false);
+  assert.equal(result.checks.github.code, 'GITHUB_COMMAND_FAILED');
+  assert.equal(result.checks.codex.code, 'CODEX_AUTH_REQUIRED');
+  assert.equal(result.checks.gitIdentity.ok, false);
+  assert.equal(result.checks.stateDatabase.ok, true);
+  assert.equal(JSON.parse(output.join('')).ok, false);
+});
+
+test('doctor CLI emits aggregated JSON and exits nonzero for an invalid state parent', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-doctor-cli-'));
+  const missingParent = join(directory, 'missing-parent');
+  const dbPath = join(missingParent, 'state.sqlite');
+  try {
+    const result = spawnSync(process.execPath, ['bin/patchpool.js', 'doctor', '--json'], {
+      cwd: process.cwd(),
+      env: { ...process.env, PATCHPOOL_DB: dbPath },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(result.status, 1);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.exitCode, 1);
+    assert.equal(payload.checks.stateDatabase.code, 'STATE_DATABASE_PARENT_UNAVAILABLE');
+    assert.equal(existsSync(missingParent), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -166,7 +252,7 @@ test('manual e2e dispatches the exact target in publish mode and applies its app
       stdout() {},
       ...authenticatedDependencies(),
       workflowFactory(input) {
-        calls.push({ workerTimeout: input.codexTimeoutMs });
+        calls.push({ workerTimeout: input.approvedTimeoutMs });
         return {
           async run(runInput) {
             calls.push(runInput);

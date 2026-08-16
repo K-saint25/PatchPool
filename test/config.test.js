@@ -79,3 +79,12 @@ test('does not include unrelated config content in the approved snapshot', () =>
     assert.throws(() => loadRepositoryConfig(path), error => error.code === 'INVALID_REPOSITORY_CONFIG');
   });
 });
+
+test('rejects duplicate top-level JSON keys instead of accepting the last value', () => {
+  withConfig('{"verifyCommand":["node","--test"],"requiredIssueLabel":"ready","timeoutMinutes":30,"timeoutMinutes":60}', path => {
+    assert.throws(
+      () => loadRepositoryConfig(path),
+      error => error.code === 'INVALID_REPOSITORY_CONFIG',
+    );
+  });
+});

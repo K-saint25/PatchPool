@@ -65,6 +65,37 @@ test('failed approved verification does not commit', async () => {
   setupState.store.close();
 });
 
+test('one approved timeout bounds both Codex and a hanging verification command', async () => {
+  const setupState = setup();
+  let codexTimeoutMs;
+  let verificationOptions;
+  setupState.codex.implement = async input => { codexTimeoutMs = input.timeoutMs; };
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'npm') {
+      verificationOptions = options;
+      return new Promise((resolve, reject) => {
+        setImmediate(() => reject(Object.assign(new Error('simulated bounded timeout'), { code: 'COMMAND_TIMEOUT' })));
+      });
+    }
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    approvedTimeoutMs: 12_345,
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {},
+  });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    error => error.code === 'WORKFLOW_VERIFICATION_FAILED',
+  );
+  assert.equal(codexTimeoutMs, 12_345);
+  assert.equal(verificationOptions.timeoutMs, 12_345);
+  setupState.store.close();
+});
+
 test('publish disables hooks, refreshes issue before push, and creates one Draft PR with disclosure', async () => {
   const setupState = setup();
   let created;

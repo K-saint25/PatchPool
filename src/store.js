@@ -23,7 +23,7 @@ function now() {
 
 function canonicalFullName(fullName) {
   const value = String(fullName ?? '').trim();
-  if (!/^[^/\s]+\/[^/\s]+$/.test(value)) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) {
     throw new PatchPoolError('INVALID_REPOSITORY', 'Repository must use the owner/name form');
   }
   return value;

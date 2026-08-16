@@ -1,5 +1,6 @@
-import { accessSync, constants as fsConstants } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 const MINIMUM_NODE_MAJOR = 24;
 
@@ -18,21 +19,51 @@ async function gitValue(runner, key) {
   return value;
 }
 
-function checkStateDatabase(store, dbPath) {
-  const path = dbPath ?? store?.path ?? '.patchpool.sqlite';
-  if (!store?.db || store.db.prepare('SELECT 1 AS value').get()?.value !== 1) {
-    throw Object.assign(new Error('State database is not open'), { code: 'STATE_DATABASE_UNAVAILABLE' });
+function stateError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function checkParent(path) {
+  const parent = dirname(resolve(path));
+  try {
+    if (!statSync(parent).isDirectory()) throw new Error('not a directory');
+    accessSync(parent, fsConstants.R_OK | fsConstants.W_OK);
+  } catch {
+    throw stateError('STATE_DATABASE_PARENT_UNAVAILABLE', 'State database parent directory is unavailable or not writable');
   }
-  if (path !== ':memory:') {
-    const absolute = resolve(path);
+}
+
+function checkStateDatabase(path = '.patchpool.sqlite') {
+  if (path === ':memory:') {
+    return { path, exists: false, writable: true, openable: true, ephemeral: true };
+  }
+  checkParent(path);
+  const absolute = resolve(path);
+  if (!existsSync(absolute)) {
+    return { path, exists: false, writable: true, openable: true, creatable: true };
+  }
+  try {
+    if (!statSync(absolute).isFile()) throw new Error('not a file');
     accessSync(absolute, fsConstants.R_OK | fsConstants.W_OK);
-    accessSync(dirname(absolute), fsConstants.W_OK);
+  } catch {
+    throw stateError('STATE_DATABASE_NOT_WRITABLE', 'Existing state database is not a readable and writable file');
   }
-  return { path, writable: true, openable: true };
+  let database;
+  try {
+    database = new DatabaseSync(absolute, { readOnly: true });
+    const integrity = database.prepare('PRAGMA quick_check').all();
+    if (integrity.length === 0 || integrity.some(row => row.quick_check !== 'ok')) {
+      throw new Error('integrity check failed');
+    }
+  } catch {
+    throw stateError('STATE_DATABASE_INVALID', 'Existing state database could not be checked read-only');
+  } finally {
+    try { database?.close(); } catch { /* preserve the state check result */ }
+  }
+  return { path, exists: true, writable: true, openable: true, integrity: 'ok' };
 }
 
 export async function runDoctor({
-  store,
   dbPath,
   runner,
   github,
@@ -49,7 +80,7 @@ export async function runDoctor({
     name: await gitValue(runner, 'user.name'),
     email: await gitValue(runner, 'user.email'),
   }), 'GIT_IDENTITY_MISSING');
-  const stateDatabase = await checked(() => checkStateDatabase(store, dbPath), 'STATE_DATABASE_UNAVAILABLE');
+  const stateDatabase = await checked(() => checkStateDatabase(dbPath), 'STATE_DATABASE_UNAVAILABLE');
   const checks = {
     node,
     github: githubCheck,

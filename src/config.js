@@ -20,6 +20,59 @@ function regularFile(path) {
   }
 }
 
+function skipWhitespace(source, index) {
+  while (index < source.length && /[\t\n\r ]/.test(source[index])) index += 1;
+  return index;
+}
+
+function stringEnd(source, start) {
+  let escaped = false;
+  for (let index = start + 1; index < source.length; index += 1) {
+    const character = source[index];
+    if (!escaped && character === '"') return index + 1;
+    if (!escaped && character === '\\') escaped = true;
+    else escaped = false;
+  }
+  return source.length;
+}
+
+function rejectDuplicateTopLevelKeys(source) {
+  let index = skipWhitespace(source, 0);
+  if (source[index] !== '{') return;
+  index += 1;
+  const keys = new Set();
+  while (index < source.length) {
+    index = skipWhitespace(source, index);
+    if (source[index] === '}') return;
+    if (source[index] !== '"') return;
+    const end = stringEnd(source, index);
+    let key;
+    try { key = JSON.parse(source.slice(index, end)); } catch { return; }
+    if (keys.has(key)) invalid('.patchpool.json contains a duplicate top-level key');
+    keys.add(key);
+    index = skipWhitespace(source, end);
+    if (source[index] !== ':') return;
+    index += 1;
+    let nested = 0;
+    while (index < source.length) {
+      const character = source[index];
+      if (character === '"') {
+        index = stringEnd(source, index);
+        continue;
+      }
+      if (character === '{' || character === '[') nested += 1;
+      else if (character === '}' || character === ']') {
+        if (character === '}' && nested === 0) return;
+        nested -= 1;
+      } else if (character === ',' && nested === 0) {
+        index += 1;
+        break;
+      }
+      index += 1;
+    }
+  }
+}
+
 function parseConfig(path) {
   let source;
   try {
@@ -32,8 +85,10 @@ function parseConfig(path) {
   }
   let value;
   try {
+    rejectDuplicateTopLevelKeys(source);
     value = JSON.parse(source);
-  } catch {
+  } catch (error) {
+    if (error?.code === 'INVALID_REPOSITORY_CONFIG') throw error;
     invalid('.patchpool.json must contain valid JSON');
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid('.patchpool.json must contain a JSON object');
