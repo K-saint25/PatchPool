@@ -44,3 +44,30 @@ The implementation prompt is sent on stdin. On Windows, when the npm installatio
 ## Concerns
 
 None for Task 3. The workflow layer still owns eligibility policy, claim ordering, verification, commit, push, and PR reconciliation.
+
+## Fix round 1
+
+### RED evidence
+
+Added focused regression coverage before changing production code:
+
+- `test/github.test.js` failed for a structured `gh pr create` response because it returned without `gh pr view`; it also exposed raw `TypeError` failures for `null`/array JSON, accepted `INTERNAL` visibility, and accepted a PR URL belonging to another repository.
+- `test/codex.test.js` failed because `Logged in using API key` matched the old generic logged-in check.
+- `test/prompt.test.js` failed because repository text was outside the untrusted delimiter and non-canonical repository names were accepted.
+
+The focused command was `npm test -- test/github.test.js test/codex.test.js test/prompt.test.js`; these failures were expected review-regression failures, not test setup failures.
+
+### GREEN evidence
+
+- `npm test -- test/github.test.js test/codex.test.js test/prompt.test.js` — 16 passed, 0 failed.
+- `npm test` — full suite passes after the fixes.
+- `node --check src/github.js`, `node --check src/codex.js`, and `node --check src/prompt.js` pass.
+
+### Fixes and self-review
+
+- Every Draft create response, including structured output, now extracts and validates the canonical GitHub PR URL and performs an independent `gh pr view`; the verified response must be Draft, point to the requested branch, and match the created PR URL.
+- GitHub JSON object/array shapes are validated before property access and map to `GITHUB_INVALID_JSON`; repository visibility must be explicitly public, with private/internal/archived/non-canonical data rejected.
+- Codex preflight requires ChatGPT status semantics and explicitly rejects API-key status text.
+- `buildImplementationPrompt` validates canonical `owner/name` and places repository metadata inside the same `<untrusted-data>` boundary as issue content; trusted policy text contains no interpolated repository data.
+- PR URLs are HTTPS `github.com` URLs with the exact requested owner/repository and numeric `/pull/<number>` path.
+- The focused Codex argv test continues to assert the installed CLI contract: safety globals precede `exec`, `--cd` scopes the worktree, and ignore flags remain intentional.

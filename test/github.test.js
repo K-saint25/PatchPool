@@ -41,11 +41,22 @@ test('getRepository requests JSON and accepts only canonical public non-archived
   assert.deepEqual(runner.calls[0].args, ['api', 'repos/octo/example']);
 });
 
-test('getRepository rejects malformed JSON and non-canonical/private/archived repositories', async () => {
-  for (const stdout of ['not-json', JSON.stringify({ nameWithOwner: 'octo/other', isPrivate: false, isArchived: false }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: true, isArchived: false }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: true })]) {
+test('getRepository rejects malformed JSON and non-canonical/private/internal/archived repositories', async () => {
+  for (const stdout of ['not-json', 'null', '[]', JSON.stringify({ nameWithOwner: 'octo/other', isPrivate: false, isArchived: false, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: true, isArchived: false, visibility: 'PRIVATE' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: true, visibility: 'PUBLIC' }), JSON.stringify({ nameWithOwner: 'octo/example', isPrivate: false, isArchived: false, visibility: 'INTERNAL' })]) {
     const runner = scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]);
     const client = new GitHubClient({ runner });
-    await assert.rejects(() => client.getRepository('octo/example'));
+    await assert.rejects(() => client.getRepository('octo/example'), error => error.code === 'GITHUB_INVALID_JSON' || error.code === 'GITHUB_REPOSITORY_INELIGIBLE');
+  }
+});
+
+test('GitHub JSON object shape failures map to stable adapter errors', async () => {
+  for (const action of [
+    client => client.getIssue('octo/example', 4),
+    client => client.getViewerLogin(),
+    client => client.getPushRemote({ fullName: 'octo/example' }),
+  ]) {
+    const runner = scriptedRunner([{ exitCode: 0, stdout: 'null', stderr: '' }]);
+    await assert.rejects(() => action(new GitHubClient({ runner })), error => error.code === 'GITHUB_INVALID_JSON');
   }
 });
 
@@ -85,10 +96,17 @@ test('createDraftPullRequest rejects a response that is not verified as Draft', 
   await assert.rejects(() => client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' }), error => error.code === 'GITHUB_PR_NOT_DRAFT');
 });
 
-test('createDraftPullRequest accepts and verifies a structured Draft response', async () => {
-  const runner = scriptedRunner([{ exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true }), stderr: '' }]);
+test('createDraftPullRequest always verifies a structured Draft response remotely', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true }), stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patch/4' }), stderr: '' }]);
   const client = new GitHubClient({ runner });
   const pr = await client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' });
   assert.equal(pr.isDraft, true);
+  assert.deepEqual(runner.calls[1].args, ['pr', 'view', 'https://github.com/octo/example/pull/2', '--json', 'number,url,isDraft,headRefName']);
+});
+
+test('createDraftPullRequest rejects a URL for a different repository before reconciliation', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: 'https://github.com/other/repo/pull/2\n', stderr: '' }]);
+  const client = new GitHubClient({ runner });
+  await assert.rejects(() => client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' }), error => error.code === 'GITHUB_INVALID_PR_URL');
   assert.equal(runner.calls.length, 1);
 });

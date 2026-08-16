@@ -17,6 +17,20 @@ function json(stdout, context) {
   }
 }
 
+function jsonObject(stdout, context) {
+  const value = json(stdout, context);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new PatchPoolError('GITHUB_INVALID_JSON', `GitHub returned an invalid object for ${context}`);
+  }
+  return value;
+}
+
+function jsonArray(stdout, context) {
+  const value = json(stdout, context);
+  if (!Array.isArray(value)) throw new PatchPoolError('GITHUB_INVALID_JSON', `GitHub returned an invalid array for ${context}`);
+  return value;
+}
+
 function assertSuccess(result, operation) {
   if (!result || result.exitCode !== 0) {
     const details = { exitCode: result?.exitCode, stderr: result?.stderr };
@@ -26,6 +40,17 @@ function assertSuccess(result, operation) {
 
 function repositoryName(repository) {
   return requireFullName(typeof repository === 'string' ? repository : repository?.fullName ?? repository?.nameWithOwner);
+}
+
+function requirePullRequestUrl(value, canonical, code = 'GITHUB_INVALID_PR_URL') {
+  if (typeof value !== 'string' || value.length === 0) throw new PatchPoolError(code, 'GitHub pull request URL is required');
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new PatchPoolError(code, 'GitHub pull request URL is invalid'); }
+  const prefix = `/${canonical}/pull/`;
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' || parsed.search || parsed.hash || !parsed.pathname.startsWith(prefix) || !/^\d+$/.test(parsed.pathname.slice(prefix.length))) {
+    throw new PatchPoolError(code, 'GitHub pull request URL does not match the requested repository');
+  }
+  return parsed.href;
 }
 
 function outputUrl(stdout) {
@@ -60,15 +85,16 @@ export class GitHubClient {
   async getRepository(fullName) {
     const canonical = requireFullName(fullName);
     const result = await this.run(['api', `repos/${canonical}`], 'repository lookup');
-    const value = json(result.stdout, 'repository lookup');
+    const value = jsonObject(result.stdout, 'repository lookup');
     const returnedName = value.nameWithOwner ?? value.full_name;
     const isPrivate = value.isPrivate ?? value.private;
     const isArchived = value.isArchived ?? value.archived;
     const visibility = String(value.visibility ?? '').toLowerCase();
-    if (returnedName !== canonical || isPrivate === true || isArchived === true || visibility === 'private') {
+    const isPublic = value.isPublic === true || value.public === true || visibility === 'public';
+    if (returnedName !== canonical || isPrivate !== false || isArchived !== false || !isPublic) {
       throw new PatchPoolError('GITHUB_REPOSITORY_INELIGIBLE', `Repository is not canonical, public, and active: ${canonical}`);
     }
-    if (returnedName === undefined || isPrivate === undefined || isArchived === undefined) {
+    if (typeof returnedName !== 'string' || isPrivate === undefined || isArchived === undefined) {
       throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub repository response omitted required fields');
     }
     return {
@@ -84,15 +110,13 @@ export class GitHubClient {
     const canonical = requireFullName(fullName);
     if (!Number.isInteger(number) || number < 1) throw new PatchPoolError('GITHUB_INVALID_ISSUE', 'Issue number must be a positive integer');
     const result = await this.run(['api', `repos/${canonical}/issues/${number}`], 'issue lookup');
-    return json(result.stdout, 'issue lookup');
+    return jsonObject(result.stdout, 'issue lookup');
   }
 
   async listIssues(fullName) {
     const canonical = requireFullName(fullName);
     const result = await this.run(['api', `repos/${canonical}/issues?state=open&per_page=100`], 'issue listing');
-    const value = json(result.stdout, 'issue listing');
-    if (!Array.isArray(value)) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub issue listing was not an array');
-    return value;
+    return jsonArray(result.stdout, 'issue listing');
   }
 
   async clone(fullName, directory) {
@@ -104,7 +128,7 @@ export class GitHubClient {
 
   async getViewerLogin() {
     const result = await this.run(['api', 'user'], 'viewer lookup');
-    const value = json(result.stdout, 'viewer lookup');
+    const value = jsonObject(result.stdout, 'viewer lookup');
     if (typeof value?.login !== 'string' || value.login.length === 0) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub viewer response omitted login');
     return value.login;
   }
@@ -112,7 +136,7 @@ export class GitHubClient {
   async getPushRemote(repository) {
     const canonical = repositoryName(repository);
     const result = await this.run(['api', `repos/${canonical}`], 'push permission lookup');
-    const value = json(result.stdout, 'push permission lookup');
+    const value = jsonObject(result.stdout, 'push permission lookup');
     const canPush = value.permissions?.push ?? (value.viewerPermission === 'WRITE' || value.viewerPermission === 'ADMIN');
     if (!canPush) throw new PatchPoolError('GITHUB_PUSH_FORBIDDEN', `No push permission for ${canonical}`);
     return {
@@ -127,8 +151,7 @@ export class GitHubClient {
     const canonical = requireFullName(fullName);
     if (typeof branch !== 'string' || branch.length === 0 || /[\r\n]/.test(branch)) throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch is required');
     const result = await this.run(['pr', 'list', '--repo', canonical, '--head', branch, '--state', 'all'], 'pull request lookup');
-    const value = json(result.stdout, 'pull request lookup');
-    if (!Array.isArray(value)) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub pull request listing was not an array');
+    const value = jsonArray(result.stdout, 'pull request lookup');
     return value.find(pr => pr?.headRefName === branch) ?? null;
   }
 
@@ -140,25 +163,18 @@ export class GitHubClient {
     if (!title) throw new PatchPoolError('GITHUB_INVALID_PR', 'Pull request title is required');
     const base = String(input?.base ?? input?.defaultBranch ?? 'main');
     const create = await this.run(['pr', 'create', '--repo', canonical, '--head', branch, '--base', base, '--title', title, '--body', String(input?.body ?? ''), '--draft'], 'pull request creation');
-    try {
-      const structured = JSON.parse(String(create.stdout ?? '').trim());
-      if (structured && typeof structured === 'object' && typeof structured.isDraft === 'boolean') {
-        if (structured.isDraft !== true || (structured.headRefName !== undefined && structured.headRefName !== branch)) {
-          throw new PatchPoolError('GITHUB_PR_NOT_DRAFT', 'Created pull request was not verified as Draft');
-        }
-        return { ...structured, isDraft: true };
-      }
-    } catch (error) {
-      if (error instanceof PatchPoolError) throw error;
-      // gh pr create normally prints a URL, so continue with URL verification.
-    }
-    const url = outputUrl(create.stdout);
+    let structured;
+    try { structured = JSON.parse(String(create.stdout ?? '').trim()); } catch { structured = undefined; }
+    const createdUrl = structured && typeof structured === 'object' && !Array.isArray(structured) ? structured.url ?? structured.html_url : outputUrl(create.stdout);
+    const url = requirePullRequestUrl(createdUrl, canonical);
     if (!url) throw new PatchPoolError('GITHUB_INVALID_JSON', 'GitHub pull request creation returned no URL');
     const verifyResult = await this.run(['pr', 'view', url, '--json', 'number,url,isDraft,headRefName'], 'pull request verification');
-    const verified = json(verifyResult.stdout, 'pull request verification');
+    const verified = jsonObject(verifyResult.stdout, 'pull request verification');
     if (verified.isDraft !== true || (verified.headRefName !== undefined && verified.headRefName !== branch)) {
       throw new PatchPoolError('GITHUB_PR_NOT_DRAFT', 'Created pull request was not verified as Draft');
     }
-    return { ...verified, url: verified.url ?? url, isDraft: true };
+    const verifiedUrl = verified.url === undefined ? url : requirePullRequestUrl(verified.url, canonical);
+    if (verifiedUrl !== url) throw new PatchPoolError('GITHUB_PR_MISMATCH', 'Verified pull request did not match the created pull request');
+    return { ...verified, url: verifiedUrl, isDraft: true };
   }
 }

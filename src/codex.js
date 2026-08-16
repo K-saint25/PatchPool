@@ -43,7 +43,8 @@ export class CodexClient {
     } catch (error) {
       throw new PatchPoolError('CODEX_AUTH_REQUIRED', 'Codex authentication preflight failed', { cause: error.code });
     }
-    if (result.exitCode !== 0 || !/chatgpt|logged[ -]?in|authenticated/i.test(`${result.stdout}\n${result.stderr}`)) {
+    const status = `${result.stdout}\n${result.stderr}`;
+    if (result.exitCode !== 0 || /api[ -_]?key/i.test(status) || !/chatgpt/i.test(status)) {
       throw new PatchPoolError('CODEX_AUTH_REQUIRED', 'Codex is not authenticated with ChatGPT');
     }
     return { authenticated: true, provider: 'ChatGPT' };

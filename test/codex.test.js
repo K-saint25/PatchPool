@@ -24,6 +24,12 @@ test('preflight checks ChatGPT authentication with codex login status', async ()
   assert.deepEqual(runner.calls[0].args, ['login', 'status']);
 });
 
+test('preflight rejects API-key authentication even when status says logged in', async () => {
+  const runner = scriptedRunner([{ exitCode: 0, stdout: 'Logged in using API key', stderr: '' }]);
+  const client = new CodexClient({ runner, platform: 'linux' });
+  await assert.rejects(() => client.preflight(), error => error.code === 'CODEX_AUTH_REQUIRED');
+});
+
 test('implement puts global flags before exec and sends prompt on stdin', async () => {
   const runner = scriptedRunner([{ exitCode: 0, stdout: '{"type":"turn.started"}\n{"type":"turn.completed"}\n', stderr: '' }]);
   const client = new CodexClient({ runner, platform: 'linux', command: 'codex' });
