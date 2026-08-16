@@ -13,6 +13,7 @@ const HELP = `Usage:
   patchpool doctor [--json]
   patchpool repo add --repo <owner/name> [--config <path>]
   patchpool repo list [--json]
+  patchpool claim list --json
   patchpool run --repo <owner/name> [--issue N] [--publish] [--keep-workspace]
   patchpool e2e --repo K-saint25/PatchPool [--issue N] --publish
 `;
@@ -67,6 +68,18 @@ function required(options, key, label = key) {
 
 function emit(stdout, value, json = true) {
   stdout(`${json ? JSON.stringify(value) : String(value)}\n`);
+}
+
+function assertClaimListArguments(argv) {
+  let parsed;
+  try {
+    parsed = parseArguments(argv.slice(2));
+  } catch {
+    throw new PatchPoolError('INVALID_ARGS', 'claim list requires --json and accepts no other arguments');
+  }
+  const { positional, options } = parsed;
+  const unsupported = positional.length > 0 || !options.json || Object.keys(options).some(key => key !== 'json');
+  if (unsupported) throw new PatchPoolError('INVALID_ARGS', 'claim list requires --json and accepts no other arguments');
 }
 
 async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env, codexModel, cwd = process.cwd(), dbPath, nodeVersion }) {
@@ -174,6 +187,13 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   if (argv[0] === 'help' || argv.includes('--help')) {
     stdout(HELP);
     return { command: 'help', exitCode: 0 };
+  }
+  if (argv[0] === 'claim' && argv[1] === 'list') {
+    assertClaimListArguments(argv);
+    const dbPath = options.dbPath ?? process.env.PATCHPOOL_DB ?? '.patchpool.sqlite';
+    const claims = options.store ? options.store.listClaims() : PatchPoolStore.listClaimsReadOnly(dbPath);
+    emit(stdout, claims);
+    return claims;
   }
   const environment = options.environment ?? process.env;
   const codexModel = resolveCodexModel(environment);

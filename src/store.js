@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { PatchPoolError } from './errors.js';
 
 const SCHEMA_VERSION = 1;
@@ -15,6 +17,13 @@ const TRANSITIONS = new Map([
   ['pushed', new Set(['pr_opened', 'failed'])],
   ['pr_opened', new Set(['failed'])],
   ['failed', new Set(['failed'])],
+]);
+const REQUIRED_SCHEMA = new Map([
+  ['schema_meta', ['id', 'version']],
+  ['repositories', ['id', 'full_name', 'active', 'is_public', 'config_digest', 'verification_argv', 'required_label', 'blocking_labels', 'policy_json', 'created_at', 'updated_at']],
+  ['claims', ['id', 'repo_id', 'issue_number', 'worker_id', 'state', 'fields_json', 'claimed_at', 'updated_at']],
+  ['events', ['id', 'claim_id', 'event_type', 'payload_json', 'created_at']],
+  ['execution_leases', ['claim_id', 'worker_id', 'token', 'acquired_at', 'expires_at', 'owner_pid', 'owner_session_id']],
 ]);
 
 function now() {
@@ -97,6 +106,62 @@ function mapClaim(row) {
     claimedAt: row.claimed_at,
     updatedAt: row.updated_at,
   };
+}
+
+function mapClaimSummary(row) {
+  const fields = json(row.fields_json, {});
+  const optionalString = key => typeof fields[key] === 'string' ? fields[key] : null;
+  return {
+    id: row.id,
+    repoId: row.repo_id,
+    repositoryFullName: row.repository_full_name,
+    issueNumber: row.issue_number,
+    workerId: row.worker_id,
+    state: row.state,
+    branch: optionalString('branch'),
+    workspace: optionalString('workspace'),
+    commitSha: optionalString('commitSha'),
+    prUrl: optionalString('prUrl'),
+    errorCode: optionalString('errorCode'),
+    claimedAt: row.claimed_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function incompatibleStateDatabase() {
+  return new PatchPoolError('STATE_DATABASE_INCOMPATIBLE', 'State database is not a compatible current PatchPool database');
+}
+
+function assertCurrentSchema(database) {
+  const integrity = database.prepare('PRAGMA quick_check').all();
+  if (integrity.length === 0 || integrity.some(row => row.quick_check !== 'ok')) throw incompatibleStateDatabase();
+  const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
+  for (const [table, requiredColumns] of REQUIRED_SCHEMA) {
+    if (!tables.has(table)) throw incompatibleStateDatabase();
+    const columns = new Set(database.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+    if (requiredColumns.some(column => !columns.has(column))) throw incompatibleStateDatabase();
+  }
+  const metadata = database.prepare('SELECT id, version FROM schema_meta WHERE id = 1').get();
+  if (metadata?.id !== 1 || metadata.version !== SCHEMA_VERSION) throw incompatibleStateDatabase();
+  const claimsSql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get()?.sql ?? '';
+  if (!claimsSql.includes("'running'") || claimsSql.includes("'working'") || claimsSql.includes("'verifying'") || claimsSql.includes("'completed'") || claimsSql.includes("'released'")) {
+    throw incompatibleStateDatabase();
+  }
+  const activeIndexSql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'claims_one_active_issue'").get()?.sql ?? '';
+  if (!activeIndexSql.includes("'running'") || activeIndexSql.includes("'working'") || activeIndexSql.includes("'verifying'") || activeIndexSql.includes("'released'")) {
+    throw incompatibleStateDatabase();
+  }
+  const leaseTargets = database.prepare('PRAGMA foreign_key_list(execution_leases)').all().map(row => row.table);
+  if (leaseTargets.length !== 1 || leaseTargets[0] !== 'claims') throw incompatibleStateDatabase();
+}
+
+function queryClaimSummaries(database) {
+  return database.prepare(`
+    SELECT claims.*, repositories.full_name AS repository_full_name
+    FROM claims
+    JOIN repositories ON repositories.id = claims.repo_id
+    ORDER BY claims.id ASC
+  `).all().map(mapClaimSummary);
 }
 
 function withImmediateTransaction(db, operation) {
@@ -250,6 +315,24 @@ function assertLeaseRow(db, claimId, workerId, token, timestamp) {
 export class PatchPoolStore {
   static open(path = '.patchpool.sqlite', options) {
     return new PatchPoolStore(path, options);
+  }
+
+  static listClaimsReadOnly(path = '.patchpool.sqlite') {
+    const requestedPath = String(path ?? '.patchpool.sqlite');
+    if (requestedPath === ':memory:') return [];
+    const absolute = resolve(requestedPath);
+    if (!existsSync(absolute)) return [];
+    let database;
+    try {
+      database = new DatabaseSync(absolute, { readOnly: true });
+      assertCurrentSchema(database);
+      return queryClaimSummaries(database);
+    } catch (error) {
+      if (error?.code === 'STATE_DATABASE_INCOMPATIBLE') throw error;
+      throw incompatibleStateDatabase();
+    } finally {
+      try { database?.close(); } catch { /* preserve the read result */ }
+    }
   }
 
   constructor(path, { clock = Date.now, randomId = randomUUID, isOwnerAlive = processIsAlive, ownerSessionId = randomUUID() } = {}) {
@@ -481,6 +564,10 @@ export class PatchPoolStore {
 
   getClaim(id) {
     return mapClaim(this.db.prepare('SELECT * FROM claims WHERE id = ?').get(Number(id)));
+  }
+
+  listClaims() {
+    return queryClaimSummaries(this.db);
   }
 
   restartClaim(id, fields = {}) {
