@@ -49,6 +49,14 @@ function controlledChild({ pid = 4321, onKill } = {}) {
   return child;
 }
 
+async function waitForCondition(condition, description, timeoutMs = 1_000) {
+  const startedAt = Date.now();
+  while (!condition()) {
+    if (Date.now() - startedAt >= timeoutMs) throw new Error(`Timed out waiting for ${description}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
 test('passes an argv array without a shell', async () => {
   const calls = [];
   const runner = new CommandRunner({ spawnFn: scriptedSpawn(calls, { code: 0 }) });
@@ -269,6 +277,11 @@ test('POSIX commands default to a detached group and escalate TERM to group KILL
     processKillFn: (pid, signal) => {
       groupSignals.push({ pid, signal });
       if (signal === 'SIGKILL') process.nextTick(() => child.emit('close', null, signal));
+      if (signal === 0) {
+        const error = new Error('process group does not exist');
+        error.code = 'ESRCH';
+        throw error;
+      }
       return true;
     },
     terminationConfirmationMs: 1,
@@ -282,6 +295,71 @@ test('POSIX commands default to a detached group and escalate TERM to group KILL
   assert.deepEqual(groupSignals, [
     { pid: -2468, signal: 'SIGTERM' },
     { pid: -2468, signal: 'SIGKILL' },
+    { pid: -2468, signal: 0 },
+  ]);
+});
+
+test('POSIX kills and confirms the group after its leader closes during TERM grace', async () => {
+  const groupSignals = [];
+  const child = controlledChild({ pid: 3579 });
+  const runner = new CommandRunner({
+    spawnFn: () => child,
+    platform: 'linux',
+    processKillFn: (pid, signal) => {
+      groupSignals.push({ pid, signal });
+      if (signal === 'SIGTERM') process.nextTick(() => child.emit('close', null, signal));
+      if (signal === 0) {
+        const error = new Error('process group does not exist');
+        error.code = 'ESRCH';
+        throw error;
+      }
+      return true;
+    },
+    terminationConfirmationMs: 1,
+  });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
+  assert.deepEqual(groupSignals, [
+    { pid: -3579, signal: 'SIGTERM' },
+    { pid: -3579, signal: 'SIGKILL' },
+    { pid: -3579, signal: 0 },
+  ]);
+});
+
+test('POSIX remains pending when the process group still exists after KILL', async () => {
+  const groupSignals = [];
+  let unsafeWaitStarted = false;
+  const child = controlledChild({ pid: 4680 });
+  const runner = new CommandRunner({
+    spawnFn: () => child,
+    platform: 'linux',
+    processKillFn: (pid, signal) => {
+      groupSignals.push({ pid, signal });
+      if (signal === 'SIGTERM') process.nextTick(() => child.emit('close', null, signal));
+      return true;
+    },
+    unsafeTerminationWaitFn: () => {
+      unsafeWaitStarted = true;
+      return new Promise(() => {});
+    },
+    terminationConfirmationMs: 1,
+  });
+  const controller = new AbortController();
+  let settled = false;
+  const running = runner.run('git', ['push'], { signal: controller.signal });
+  void running.then(() => { settled = true; }, () => { settled = true; });
+  controller.abort();
+  await waitForCondition(() => unsafeWaitStarted, 'unsafe process-group wait');
+
+  assert.equal(settled, false);
+  assert.equal(unsafeWaitStarted, true);
+  assert.deepEqual(groupSignals.slice(0, 3), [
+    { pid: -4680, signal: 'SIGTERM' },
+    { pid: -4680, signal: 'SIGKILL' },
+    { pid: -4680, signal: 0 },
   ]);
 });
 

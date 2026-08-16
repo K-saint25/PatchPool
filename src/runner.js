@@ -120,6 +120,24 @@ function waitForManualTermination() {
   });
 }
 
+function wait(durationMs) {
+  return new Promise(resolve => setTimeout(resolve, durationMs));
+}
+
+async function waitForProcessGroupExit(processKillFn, pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      processKillFn(-pid, 0);
+    } catch (error) {
+      return error?.code === 'ESRCH';
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await wait(Math.min(25, remaining));
+  }
+}
+
 export class CommandRunner {
   constructor({
     spawnFn = spawn,
@@ -221,21 +239,21 @@ export class CommandRunner {
             await this.unsafeTerminationWaitFn();
             return;
           }
-          if (!closed) await waitForClose(this.terminationConfirmationMs);
-          if (!closed && this.platform !== 'win32' && spawnOptions.detached === true && Number.isInteger(child.pid) && child.pid > 0) {
-            let groupKillConfirmed = false;
+          const hasProcessGroup = this.platform !== 'win32' && spawnOptions.detached === true && Number.isInteger(child.pid) && child.pid > 0;
+          if (hasProcessGroup) {
+            await wait(this.terminationConfirmationMs);
+            let groupExitConfirmed = false;
             try {
               this.processKillFn(-child.pid, 'SIGKILL');
-              groupKillConfirmed = true;
-            } catch {
-              groupKillConfirmed = closed;
+              groupExitConfirmed = await waitForProcessGroupExit(this.processKillFn, child.pid, this.terminationConfirmationMs);
+            } catch (error) {
+              groupExitConfirmed = error?.code === 'ESRCH';
             }
-            if (!groupKillConfirmed) {
+            if (!groupExitConfirmed) {
               await this.unsafeTerminationWaitFn();
               return;
             }
-            if (!closed) await waitForClose(this.terminationConfirmationMs);
-          }
+          } else if (!closed) await waitForClose(this.terminationConfirmationMs);
           if (!closed) await closedPromise;
           const captured = output();
           finish(reject, new PatchPoolError(code, message, { ...details, ...captured }));
