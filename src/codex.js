@@ -2,6 +2,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { PatchPoolError } from './errors.js';
 
+const WINDOWS_SANDBOX_CONFIG = 'windows.sandbox="elevated"';
+
 function rateLimited(value) {
   return /(?:rate[ -]?limit|rate_limit|too many requests|quota exceeded|429)/i.test(String(value ?? ''));
 }
@@ -54,7 +56,8 @@ export class CodexClient {
     if (typeof cwd !== 'string' || cwd.length === 0) throw new PatchPoolError('CODEX_INVALID_WORKTREE', 'Codex worktree directory is required');
     if (typeof prompt !== 'string') throw new PatchPoolError('CODEX_INVALID_PROMPT', 'Codex prompt is required');
     const { command, prefix } = invocation(this.options);
-    const args = [...prefix, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
+    const platformConfig = this.options.platform === 'win32' ? ['-c', WINDOWS_SANDBOX_CONFIG] : [];
+    const args = [...prefix, ...platformConfig, '--ask-for-approval', 'never', '--sandbox', 'workspace-write', '--cd', cwd, 'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--color', 'never', '-'];
     let result;
     try {
       result = await this.runner.run(command, args, { cwd, stdin: prompt, timeoutMs, ...(env ? { env } : {}) });

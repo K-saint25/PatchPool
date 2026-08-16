@@ -46,7 +46,25 @@ test('implement uses the Windows Node executable and installed codex.js without 
   const client = new CodexClient({ runner, platform: 'win32', execPath: 'C:\\Program Files\\nodejs\\node.exe', codexPath: 'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js' });
   await client.implement({ cwd: 'C:\\work', prompt: 'x' });
   assert.equal(runner.calls[0].command, 'C:\\Program Files\\nodejs\\node.exe');
-  assert.equal(runner.calls[0].args[0], 'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js');
+  assert.deepEqual(runner.calls[0].args, [
+    'C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js',
+    '-c',
+    'windows.sandbox="elevated"',
+    '--ask-for-approval',
+    'never',
+    '--sandbox',
+    'workspace-write',
+    '--cd',
+    'C:\\work',
+    'exec',
+    '--json',
+    '--ephemeral',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--color',
+    'never',
+    '-',
+  ]);
 });
 
 test('implement maps timeout, rate limit, nonzero, failed events, and missing terminal events', async () => {
