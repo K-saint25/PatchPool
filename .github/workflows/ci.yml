@@ -34,3 +34,6 @@ jobs:
 
       - name: Verify package contents
         run: npm pack --dry-run
+
+      - name: Validate package tarball manifest
+        run: node support/check-package-tarball.js

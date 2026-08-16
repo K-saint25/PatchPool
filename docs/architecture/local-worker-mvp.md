@@ -34,6 +34,10 @@ active so an operator can inspect the worktree. `--publish` is the only path to
 commit, push, and Draft-PR creation. On retry, `committed` and `pushed` states
 reconcile the branch/PR before creating another remote object.
 
+The self-dogfood command is `e2e --repo K-saint25/PatchPool --publish`.
+The end-to-end path hard-guards that exact public repository and refuses to
+run without explicit publish authorization.
+
 ## Boundaries and trust
 
 | Boundary | Rule |
@@ -48,31 +52,38 @@ reconcile the branch/PR before creating another remote object.
 
 ## Configuration and implementation notes
 
-`.patchpool.json` is the checked-in policy source for humans and future tooling:
+`.patchpool.json` is the checked-in policy source loaded by `repo add`:
 
 ```json
 {"verifyCommand":["npm","test"],"requiredIssueLabel":"patchpool-ready","timeoutMinutes":30}
 ```
 
-The current CLI does not parse this file. Operators pass its verification argv,
-required label, and SHA-256 digest to `repo add`; the digest is persisted as an
-immutable approval record. `timeoutMinutes` is policy metadata in this MVP and
-is not currently wired to a CLI option; the workflow uses its adapter timeout
-defaults. Automatic config loading and policy-timeout enforcement are follow-up
-work, not a reason to silently substitute different verification commands.
+`repo add --config .patchpool.json` validates the file, checks GitHub for the
+canonical repository's public and non-archived status, and persists the
+approved configuration snapshot. Omitting `--config` loads `.patchpool.json`
+from the current working directory. The `verifyCommand` is executed as argv,
+never through a shell. `timeoutMinutes` bounds both Codex implementation and
+the configured verification command; clone, push, and pull-request operations
+use separate bounded adapter deadlines.
 
 The default database is `.patchpool.sqlite` in the current directory (or the
 `PATCHPOOL_DB` path). Worktrees are created below the OS temporary directory
 and cleaned up unless `--keep-workspace` is requested. Package publishing
 excludes SQLite state, `.env` files, and worker workspaces through `.npmignore`.
 
+`doctor` is read-only: it checks Node.js 24+, `gh` authentication, Codex
+ChatGPT authentication, Git author identity, state-store readability, and that
+worker signing is disabled. It does not claim issues or change the state DB.
+
 ## Failure and recovery boundaries
 
 - A failed Codex or verification step is persisted as `failed`; fix the local
   cause and rerun after checking the recorded workspace and claim.
-- A dry-run's `verified` claim has no public release command yet. Manual state
-  recovery is allowed only after confirming that no process or remote side
-  effect is pending.
+- A dry-run's `verified` claim is intentionally retained as a fail-safe. Stop
+  the worker, resolve `PATCHPOOL_DB` (or the default `.patchpool.sqlite`), and
+  back up the database plus adjacent `-wal`/`-shm` files before using supported
+  state-recovery tooling. Never delete claim or lease rows just to unblock a
+  retry.
 - If process termination cannot be confirmed, the run stays pending. Do not
   start another worker until the process and its descendants have been checked.
 - Windows termination uses `taskkill` by PID. PID reuse is a small residual
@@ -80,6 +91,9 @@ excludes SQLite state, `.env` files, and worker workspaces through `.npmignore`.
 - An expired legacy execution lease with no owner PID/session metadata cannot
   be safely attributed to a dead process and therefore requires manual state
   recovery; it is never automatically reclaimed.
+- If a branch was pushed, inspect its GitHub branch and Draft PR before retrying;
+  the workflow should reconcile the recorded remote side effect rather than
+  create a duplicate.
 - The same SQLite database provides a local lock on one PC only. Two separate
   computers can still claim the same GitHub issue; central scheduling and
   distributed locks are outside this MVP.

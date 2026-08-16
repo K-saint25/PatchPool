@@ -37,8 +37,10 @@ node bin/patchpool.js doctor --json
 ```
 
 `doctor` checks GitHub CLI authentication and Codex ChatGPT authentication. It
-does not transmit credentials to PatchPool and it does not accept an OpenAI API
-key for this workflow.
+also checks Node.js 24+, the local Git author identity, read-only access to the
+state database, and that Git signing is disabled for worker commits. It does
+not claim an issue, mutate state, transmit credentials to PatchPool, or accept
+an OpenAI API key for this workflow.
 
 ## Register a repository
 
@@ -49,20 +51,23 @@ in [`.patchpool.json`](.patchpool.json) is the repository policy for this MVP:
 {"verifyCommand":["npm","test"],"requiredIssueLabel":"patchpool-ready","timeoutMinutes":30}
 ```
 
-The current CLI accepts the policy values as explicit registration arguments;
-it does not load `.patchpool.json` automatically. Compute its digest, then copy
-the printed value into `--config-digest`:
+The 30-minute policy timeout bounds both the Codex implementation and the
+registered verification command. Clone, push, and pull-request operations have
+their own bounded adapter deadlines.
+
+Register from the repository root with the checked-in config. The CLI loads and
+validates this file, checks GitHub for the canonical repository's public and
+non-archived status, and stores the approved policy snapshot:
 
 ```text
-node -e "const fs=require('node:fs');const {createHash}=require('node:crypto');process.stdout.write('sha256:'+createHash('sha256').update(fs.readFileSync('.patchpool.json')).digest('hex'))"
-node bin/patchpool.js repo add --repo K-saint25/PatchPool --config-digest <printed-digest> --verification-argv '["npm","test"]' --required-label patchpool-ready
+node bin/patchpool.js repo add --repo K-saint25/PatchPool --config .patchpool.json
 node bin/patchpool.js repo list --json
 ```
 
-The single-quoted JSON argument works in PowerShell and POSIX shells; use the
-equivalent escaped quoting in `cmd.exe`. Registration is immutable in the
-current store: to change an approved policy, use a new local state database or
-perform an explicitly reviewed manual migration.
+If `--config` is omitted, the CLI automatically loads `.patchpool.json` from
+the current working directory. Registration is immutable in the current store:
+to change an approved policy, use a new local state database or perform an
+explicitly reviewed manual migration.
 
 ## Dry-run and publish
 
@@ -91,14 +96,17 @@ AI-assisted and asks for human review.
 ## Self-dogfood
 
 After registering this repository and creating an owner-controlled issue with
-the `patchpool-ready` label, the intended self-dogfood command is:
+the `patchpool-ready` label, the intended self-dogfood command is the guarded
+end-to-end path:
 
 ```text
-node bin/patchpool.js run --repo K-saint25/PatchPool --issue <owner-controlled-issue> --publish
+node bin/patchpool.js e2e --repo K-saint25/PatchPool --publish
 ```
 
-Use a small documentation issue that is not already fixed. Inspect the dry-run
-result first; only then use `--publish`.
+`e2e` accepts exactly `K-saint25/PatchPool` and requires `--publish`; it selects
+the eligible owner-controlled issue and runs the full push-plus-Draft-PR flow.
+Use a small documentation issue that is not already fixed. Inspect a normal
+dry-run first; only then use the guarded command.
 
 ## State and workspace locations
 
@@ -121,21 +129,22 @@ The worker persists each external side effect. Rerunning can reconcile a
 verification or Codex failure is safe to inspect and retry after fixing the
 cause.
 
-There is currently no public `claim release` command. A dry-run intentionally
-leaves its `verified` claim active as a fail-safe. After confirming that no
-worker is running and no remote side effect is pending, an operator may mark a
-claim failed with the local store API (replace `<claim-id>`):
+A dry-run intentionally leaves its `verified` claim active as a fail-safe. For
+manual recovery:
 
-```text
-node --input-type=module -e "import {PatchPoolStore} from './src/store.js';const s=PatchPoolStore.open();const id=Number(process.argv[1]);console.log(s.transitionClaim(id,'failed',{errorCode:'MANUAL_RECOVERY'}));s.close()" <claim-id>
-```
-
-Do not force recovery while process termination is unconfirmed. On Windows,
-`taskkill` is PID-based and has a small PID-reuse residual; if termination or
-its confirmation cannot be established, the run remains pending and must be
-checked manually before another run. An expired legacy execution lease without
-owner PID/session metadata also requires manual state recovery; it is not
-automatically reclaimed.
+1. Stop the worker and all child processes. If termination cannot be confirmed,
+   leave the run pending and investigate before starting another worker. On
+   Windows, `taskkill` is PID-based and has a small PID-reuse residual.
+2. Resolve the state path from `PATCHPOOL_DB`, or use `.patchpool.sqlite` in the
+   current directory. Close all workers, then make a filesystem backup of the
+   database and any adjacent `-wal`/`-shm` files before inspecting it.
+3. Use the supported state-recovery tooling or a maintainer-reviewed procedure
+   to reconcile the claim. Do not delete claim rows or leases just to unblock a
+   retry. An expired legacy lease without owner PID/session metadata requires
+   manual state recovery and is never automatically reclaimed.
+4. If a branch was already pushed, verify the branch and Draft PR on GitHub
+   before retrying; rerun so the workflow can reconcile the recorded remote
+   side effect rather than creating a duplicate.
 
 ## Security and AI disclosure
 

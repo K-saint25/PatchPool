@@ -1,9 +1,12 @@
 # Never publish local state, credentials, or worker workspaces.
-*.sqlite
-*.sqlite-*
+*.db
+*.sqlite*
 .patchpool.sqlite*
-.env
-.env.*
+.env*
+.codex/
+auth.json
+*.pem
+*.key
 workspaces/
 .worktrees/
 
