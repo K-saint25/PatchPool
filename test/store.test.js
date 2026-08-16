@@ -360,6 +360,36 @@ test('an expired lease can be recovered after its owner process is dead', () => 
   }
 });
 
+test('an expired legacy lease without owner identity cannot be taken over automatically', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-legacy-lease-owner-'));
+  const path = join(directory, 'state.sqlite');
+  let currentTime = 1_000;
+  const checkedOwners = [];
+  const store = PatchPoolStore.open(path, {
+    clock: () => currentTime,
+    randomId: () => 'replacement-token',
+    isOwnerAlive: owner => { checkedOwners.push(owner); return false; },
+  });
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 19, workerId: 'worker-a' });
+    store.db.prepare(`
+      INSERT INTO execution_leases (claim_id, worker_id, token, acquired_at, expires_at, owner_pid, owner_session_id)
+      VALUES (?, ?, ?, ?, ?, NULL, NULL)
+    `).run(claim.id, 'worker-a', 'legacy-token', new Date(900).toISOString(), new Date(999).toISOString());
+
+    assert.throws(
+      () => store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100, ownerPid: 9876, ownerSessionId: 'session-two' }),
+      error => error.code === 'LEASE_BUSY',
+    );
+    assert.deepEqual(checkedOwners, []);
+    assert.equal(store.db.prepare('SELECT token FROM execution_leases WHERE claim_id = ?').get(claim.id).token, 'legacy-token');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('legacy workflow migration leaves execution lease foreign keys pointing at claims', () => {
   const directory = mkdtempSync(join(tmpdir(), 'patchpool-legacy-lease-fk-'));
   const path = join(directory, 'state.sqlite');

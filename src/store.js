@@ -474,6 +474,9 @@ export class PatchPoolStore {
       if (existing && Date.parse(existing.expires_at) > timestamp) {
         throw new PatchPoolError('LEASE_BUSY', 'Claim is already being executed by this worker');
       }
+      if (existing && (!Number.isInteger(existing.owner_pid) || existing.owner_pid <= 0 || typeof existing.owner_session_id !== 'string' || !existing.owner_session_id)) {
+        throw new PatchPoolError('LEASE_BUSY', 'Expired legacy execution lease requires explicit recovery');
+      }
       if (existing && Number.isInteger(existing.owner_pid) && existing.owner_pid > 0 && typeof existing.owner_session_id === 'string' && existing.owner_session_id) {
         let alive = true;
         try { alive = this.isOwnerAlive({ pid: existing.owner_pid, sessionId: existing.owner_session_id }) !== false; } catch { /* fail closed when liveness cannot be established */ }

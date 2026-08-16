@@ -36,6 +36,19 @@ function hangingSpawn(signals) {
   };
 }
 
+function controlledChild({ pid = 4321, onKill } = {}) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = { end() {} };
+  child.kill = signal => {
+    onKill?.(signal, child);
+    return true;
+  };
+  return child;
+}
+
 test('passes an argv array without a shell', async () => {
   const calls = [];
   const runner = new CommandRunner({ spawnFn: scriptedSpawn(calls, { code: 0 }) });
@@ -70,6 +83,145 @@ test('aborting a running command terminates the child and reports COMMAND_ABORTE
   controller.abort(new Error('lease lost'));
   await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
   assert.deepEqual(signals, ['SIGTERM']);
+});
+
+test('does not report cancellation until the spawned child confirms close', async () => {
+  let child;
+  let settled = false;
+  const runner = new CommandRunner({
+    spawnFn: () => {
+      child = controlledChild();
+      return child;
+    },
+    terminationFn: async () => {},
+    terminationConfirmationMs: 100,
+  });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal }).finally(() => { settled = true; });
+
+  controller.abort();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  child.emit('close', null, 'SIGTERM');
+  await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
+});
+
+test('uses safe Windows taskkill argv and falls back to direct termination when taskkill fails', async () => {
+  const secret = 'caller-secret-value';
+  const terminationCalls = [];
+  const directSignals = [];
+  const child = controlledChild({
+    pid: 8765,
+    onKill(signal, spawnedChild) {
+      directSignals.push(signal);
+      process.nextTick(() => spawnedChild.emit('close', null, signal));
+    },
+  });
+  const terminationSpawnFn = (command, args, options) => {
+    terminationCalls.push({ command, args, options });
+    const taskkill = new EventEmitter();
+    taskkill.kill = () => true;
+    process.nextTick(() => taskkill.emit('error', new Error(`taskkill failed: ${secret}`)));
+    return taskkill;
+  };
+  const runner = new CommandRunner({
+    spawnFn: () => child,
+    terminationSpawnFn,
+    platform: 'win32',
+    terminationConfirmationMs: 1,
+  });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal, sensitiveValues: [secret] });
+  controller.abort();
+
+  await assert.rejects(running, error => {
+    assert.equal(error.code, 'COMMAND_ABORTED');
+    assert.equal(JSON.stringify(error).includes(secret), false);
+    return true;
+  });
+  assert.deepEqual(terminationCalls, [{
+    command: 'taskkill.exe',
+    args: ['/PID', '8765', '/T', '/F'],
+    options: { shell: false, windowsHide: true, stdio: 'ignore' },
+  }]);
+  assert.deepEqual(directSignals, ['SIGKILL']);
+});
+
+test('bounds a hung taskkill before escalating the direct child termination', async () => {
+  let taskkillSignal;
+  const child = controlledChild({
+    onKill(signal, spawnedChild) {
+      process.nextTick(() => spawnedChild.emit('close', null, signal));
+    },
+  });
+  const runner = new CommandRunner({
+    spawnFn: () => child,
+    terminationSpawnFn: () => {
+      const taskkill = new EventEmitter();
+      taskkill.kill = signal => {
+        taskkillSignal = signal;
+        process.nextTick(() => taskkill.emit('close', null, signal));
+        return true;
+      };
+      return taskkill;
+    },
+    platform: 'win32',
+    terminationCommandTimeoutMs: 1,
+    terminationConfirmationMs: 1,
+  });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
+  assert.equal(taskkillSignal, 'SIGKILL');
+});
+
+test('handles a child closing while Windows tree termination is still in flight', async () => {
+  const directSignals = [];
+  const child = controlledChild({ onKill: signal => directSignals.push(signal) });
+  const runner = new CommandRunner({
+    spawnFn: () => child,
+    terminationSpawnFn: () => {
+      const taskkill = new EventEmitter();
+      taskkill.kill = () => true;
+      process.nextTick(() => {
+        child.emit('close', 0, null);
+        taskkill.emit('close', 1, null);
+      });
+      return taskkill;
+    },
+    platform: 'win32',
+    terminationConfirmationMs: 1,
+  });
+  const controller = new AbortController();
+  const running = runner.run('git', ['push'], { signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(running, error => error.code === 'COMMAND_ABORTED');
+  assert.deepEqual(directSignals, []);
+});
+
+test('does not terminate a child that already closed before cancellation', async () => {
+  const directSignals = [];
+  const terminationCalls = [];
+  const child = controlledChild({ onKill: signal => directSignals.push(signal) });
+  const runner = new CommandRunner({
+    spawnFn: () => {
+      process.nextTick(() => child.emit('close', 0, null));
+      return child;
+    },
+    terminationFn: async () => { terminationCalls.push('terminate'); },
+  });
+  const controller = new AbortController();
+
+  const result = await runner.run('git', ['status'], { signal: controller.signal });
+  controller.abort();
+
+  assert.deepEqual(result, { exitCode: 0, stdout: '', stderr: '' });
+  assert.deepEqual(terminationCalls, []);
+  assert.deepEqual(directSignals, []);
 });
 
 test('does not miss cancellation that occurs while the child is being spawned', async () => {
