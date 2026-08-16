@@ -17,6 +17,17 @@ const HELP = `Usage:
   patchpool e2e --repo K-saint25/PatchPool [--issue N] --publish
 `;
 
+const CODEX_MODEL_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
+function resolveCodexModel(environment = {}) {
+  const model = environment.PATCHPOOL_CODEX_MODEL;
+  if (model === undefined || model === '') return undefined;
+  if (typeof model !== 'string' || !CODEX_MODEL_SLUG.test(model)) {
+    throw new PatchPoolError('INVALID_CODEX_MODEL', 'PATCHPOOL_CODEX_MODEL must be a valid Codex model slug');
+  }
+  return model;
+}
+
 function parseArguments(argv) {
   const positional = [];
   const options = {};
@@ -58,7 +69,7 @@ function emit(stdout, value, json = true) {
   stdout(`${json ? JSON.stringify(value) : String(value)}\n`);
 }
 
-async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env, cwd = process.cwd(), dbPath, nodeVersion }) {
+async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env, codexModel, cwd = process.cwd(), dbPath, nodeVersion }) {
   const [command, maybeSubcommand, ...remaining] = argv;
   const subcommand = command === 'repo' ? maybeSubcommand : undefined;
   const rest = command === 'repo' ? remaining : [maybeSubcommand, ...remaining].filter(item => item !== undefined);
@@ -142,7 +153,7 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
     }
     const commandRunner = runner ?? new CommandRunner();
     const gh = github ?? new GitHubClient({ runner: commandRunner });
-    const cx = codex ?? new CodexClient({ runner: commandRunner });
+    const cx = codex ?? new CodexClient({ runner: commandRunner, model: codexModel });
     const approved = store.getRepository(fullName);
     const timeoutMinutes = approved?.policy?.approvedConfig?.timeoutMinutes;
     const approvedTimeoutMs = Number.isInteger(timeoutMinutes) ? timeoutMinutes * 60 * 1_000 : undefined;
@@ -164,6 +175,8 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     stdout(HELP);
     return { command: 'help', exitCode: 0 };
   }
+  const environment = options.environment ?? process.env;
+  const codexModel = resolveCodexModel(environment);
   const requestedDbPath = options.dbPath ?? process.env.PATCHPOOL_DB;
   const common = {
     stdout,
@@ -172,7 +185,8 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     github: options.github,
     codex: options.codex,
     runner: options.runner,
-    environment: options.environment ?? process.env,
+    environment,
+    codexModel,
     cwd: options.cwd ?? process.cwd(),
     dbPath: requestedDbPath ?? '.patchpool.sqlite',
     nodeVersion: options.nodeVersion ?? process.versions.node,
@@ -188,4 +202,4 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   }
 }
 
-export { HELP, parseArguments, resolveWorkerId };
+export { HELP, parseArguments, resolveCodexModel, resolveWorkerId };
