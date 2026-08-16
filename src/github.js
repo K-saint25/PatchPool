@@ -42,6 +42,13 @@ function repositoryName(repository) {
   return requireFullName(typeof repository === 'string' ? repository : repository?.fullName ?? repository?.nameWithOwner);
 }
 
+function requireBranchName(branch) {
+  if (typeof branch !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.endsWith('/') || branch.endsWith('.') || branch.includes('//') || branch.includes('..') || branch.includes('@{')) {
+    throw new PatchPoolError('GITHUB_INVALID_BRANCH', 'Branch name is invalid');
+  }
+  return branch;
+}
+
 function requirePullRequestUrl(value, canonical, code = 'GITHUB_INVALID_PR_URL') {
   if (typeof value !== 'string' || value.length === 0) throw new PatchPoolError(code, 'GitHub pull request URL is required');
   let parsed;
@@ -64,7 +71,7 @@ function outputUrl(stdout) {
   return trimmed.split(/\s+/).find(value => /^https:\/\/github\.com\//.test(value));
 }
 
-const PR_JSON_FIELDS = 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body';
+const PR_JSON_FIELDS = 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body,state';
 
 function prRepository(value) {
   return value?.fullName ?? value?.nameWithOwner ?? value?.full_name;
@@ -136,6 +143,18 @@ export class GitHubClient {
     if (typeof directory !== 'string' || directory.length === 0) throw new PatchPoolError('GITHUB_INVALID_DIRECTORY', 'Clone directory is required');
     await this.run(['repo', 'clone', canonical, directory], 'repository clone', options);
     return directory;
+  }
+
+  async getBranchHeadSha(fullName, branch, options) {
+    const canonical = requireFullName(fullName);
+    const exactBranch = requireBranchName(branch);
+    const result = await this.run(['api', `repos/${canonical}/git/ref/heads/${exactBranch}`], 'branch ref lookup', options);
+    const value = jsonObject(result.stdout, 'branch ref lookup');
+    const sha = value.object?.sha;
+    if (value.ref !== `refs/heads/${exactBranch}` || value.object?.type !== 'commit' || typeof sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) {
+      throw new PatchPoolError('GITHUB_INVALID_REF', 'GitHub branch ref response did not match the exact requested commit ref');
+    }
+    return sha;
   }
 
   async getViewerLogin() {

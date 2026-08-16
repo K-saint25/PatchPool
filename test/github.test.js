@@ -67,9 +67,9 @@ test('issue, list, clone, viewer, remote, and PR methods use safe gh argv', asyn
     { exitCode: 0, stdout: '', stderr: '' },
     { exitCode: 0, stdout: JSON.stringify({ login: 'octocat' }), stderr: '' },
     { exitCode: 0, stdout: JSON.stringify({ sshUrl: 'git@github.com:octo/example.git', viewerPermission: 'WRITE' }), stderr: '' },
-    { exitCode: 0, stdout: JSON.stringify([{ number: 9, url: 'https://github.com/octo/example/pull/9', isDraft: true, headRefName: 'patch/4', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false }]), stderr: '' },
+    { exitCode: 0, stdout: JSON.stringify([{ number: 9, url: 'https://github.com/octo/example/pull/9', isDraft: true, state: 'OPEN', headRefName: 'patch/4', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false }]), stderr: '' },
     { exitCode: 0, stdout: 'https://github.com/octo/example/pull/10\n', stderr: '' },
-    { exitCode: 0, stdout: JSON.stringify({ number: 10, url: 'https://github.com/octo/example/pull/10', isDraft: true, headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #4' }), stderr: '' },
+    { exitCode: 0, stdout: JSON.stringify({ number: 10, url: 'https://github.com/octo/example/pull/10', isDraft: true, state: 'OPEN', headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #4' }), stderr: '' },
   ]);
   const client = new GitHubClient({ runner });
   await client.getIssue('octo/example', 4);
@@ -85,16 +85,16 @@ test('issue, list, clone, viewer, remote, and PR methods use safe gh argv', asyn
   assert.deepEqual(runner.calls[2].args, ['repo', 'clone', 'octo/example', 'C:\\tmp\\patch pool']);
   assert.deepEqual(runner.calls[3].args, ['api', 'user']);
   assert.deepEqual(runner.calls[4].args, ['api', 'repos/octo/example']);
-  assert.deepEqual(runner.calls[5].args, ['pr', 'list', '--repo', 'octo/example', '--head', 'patch/4', '--state', 'all', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body']);
+  assert.deepEqual(runner.calls[5].args, ['pr', 'list', '--repo', 'octo/example', '--head', 'patch/4', '--state', 'all', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body,state']);
   assert.deepEqual(runner.calls[6].args, ['pr', 'create', '--repo', 'octo/example', '--head', 'patch/4', '--base', 'main', '--title', 'Fix', '--body', 'Body', '--draft']);
-  assert.deepEqual(runner.calls[7].args, ['pr', 'view', 'https://github.com/octo/example/pull/10', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body']);
+  assert.deepEqual(runner.calls[7].args, ['pr', 'view', 'https://github.com/octo/example/pull/10', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body,state']);
 });
 
 test('pull request commands receive cancellation and bounded timeout options', async () => {
   const runner = scriptedRunner([
     { exitCode: 0, stdout: '[]', stderr: '' },
     { exitCode: 0, stdout: 'https://github.com/octo/example/pull/10\n', stderr: '' },
-    { exitCode: 0, stdout: JSON.stringify({ number: 10, url: 'https://github.com/octo/example/pull/10', isDraft: true, headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #4' }), stderr: '' },
+    { exitCode: 0, stdout: JSON.stringify({ number: 10, url: 'https://github.com/octo/example/pull/10', isDraft: true, state: 'OPEN', headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #4' }), stderr: '' },
   ]);
   const client = new GitHubClient({ runner });
   const controller = new AbortController();
@@ -113,6 +113,7 @@ test('repo-scoped PR commands request supported fields and normalize the canonic
     number: 9,
     url: 'https://github.com/octo/example/pull/9',
     isDraft: true,
+    state: 'OPEN',
     headRefName: 'patch/4',
     baseRefName: 'main',
     headRepository: { nameWithOwner: 'octo/example' },
@@ -136,6 +137,7 @@ test('repo-scoped PR commands request supported fields and normalize the canonic
     const fields = call.args[call.args.indexOf('--json') + 1].split(',');
     assert.equal(fields.includes('baseRepository'), false);
     assert.equal(fields.includes('isCrossRepository'), true);
+    assert.equal(fields.includes('state'), true);
   }
 });
 
@@ -161,6 +163,42 @@ test('clone forwards cancellation and bounded timeout options to the command run
   assert.equal(runner.calls[0].options.timeoutMs, 12_345);
 });
 
+test('getBranchHeadSha requests one exact branch ref with safe argv and validates its commit SHA', async () => {
+  const sha = 'a'.repeat(40);
+  const runner = scriptedRunner([{ exitCode: 0, stdout: JSON.stringify({ ref: 'refs/heads/patchpool/issue-7-1', object: { type: 'commit', sha } }), stderr: '' }]);
+  const client = new GitHubClient({ runner });
+  const controller = new AbortController();
+  const options = { signal: controller.signal, timeoutMs: 12_345 };
+
+  assert.equal(await client.getBranchHeadSha('octo/example', 'patchpool/issue-7-1', options), sha);
+  assert.deepEqual(runner.calls[0], {
+    command: 'gh',
+    args: ['api', 'repos/octo/example/git/ref/heads/patchpool/issue-7-1'],
+    options,
+  });
+});
+
+test('getBranchHeadSha rejects unsafe names and malformed or non-exact ref responses', async () => {
+  const sha = 'a'.repeat(40);
+  const responses = [
+    'not-json',
+    JSON.stringify({ ref: 'refs/heads/patchpool/issue-7-10', object: { type: 'commit', sha } }),
+    JSON.stringify({ ref: 'refs/heads/patchpool/issue-7-1', object: { type: 'tag', sha } }),
+    JSON.stringify({ ref: 'refs/heads/patchpool/issue-7-1', object: { type: 'commit', sha: 'short' } }),
+  ];
+  for (const stdout of responses) {
+    const client = new GitHubClient({ runner: scriptedRunner([{ exitCode: 0, stdout, stderr: '' }]) });
+    await assert.rejects(
+      () => client.getBranchHeadSha('octo/example', 'patchpool/issue-7-1'),
+      error => error.code === 'GITHUB_INVALID_JSON' || error.code === 'GITHUB_INVALID_REF',
+    );
+  }
+  const runner = scriptedRunner([]);
+  const client = new GitHubClient({ runner });
+  await assert.rejects(() => client.getBranchHeadSha('octo/example', '../main'), error => error.code === 'GITHUB_INVALID_BRANCH');
+  assert.equal(runner.calls.length, 0);
+});
+
 test('createDraftPullRequest rejects a response that is not verified as Draft', async () => {
   const runner = scriptedRunner([{ exitCode: 0, stdout: 'https://github.com/octo/example/pull/1\n', stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 1, url: 'https://github.com/octo/example/pull/1', isDraft: false }), stderr: '' }]);
   const client = new GitHubClient({ runner });
@@ -168,11 +206,11 @@ test('createDraftPullRequest rejects a response that is not verified as Draft', 
 });
 
 test('createDraftPullRequest always verifies a structured Draft response remotely', async () => {
-  const runner = scriptedRunner([{ exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true }), stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #2' }), stderr: '' }]);
+  const runner = scriptedRunner([{ exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true }), stderr: '' }, { exitCode: 0, stdout: JSON.stringify({ number: 2, url: 'https://github.com/octo/example/pull/2', isDraft: true, state: 'OPEN', headRefName: 'patch/4', baseRefName: 'main', headRepository: { nameWithOwner: 'octo/example' }, isCrossRepository: false, body: 'AI-assisted implementation. Closes #2' }), stderr: '' }]);
   const client = new GitHubClient({ runner });
   const pr = await client.createDraftPullRequest({ repository: 'octo/example', branch: 'patch/4', title: 'Fix', body: 'Body' });
   assert.equal(pr.isDraft, true);
-  assert.deepEqual(runner.calls[1].args, ['pr', 'view', 'https://github.com/octo/example/pull/2', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body']);
+  assert.deepEqual(runner.calls[1].args, ['pr', 'view', 'https://github.com/octo/example/pull/2', '--json', 'number,url,isDraft,headRefName,baseRefName,headRepository,isCrossRepository,body,state']);
 });
 
 test('createDraftPullRequest rejects a URL for a different repository before reconciliation', async () => {
