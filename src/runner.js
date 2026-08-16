@@ -46,11 +46,12 @@ function appendLimited(chunks, state, value, maxBytes) {
   state.bytes += chunk.length;
 }
 
-function spawnOptionsFrom(options) {
+function spawnOptionsFrom(options, platform) {
   const spawnOptions = { shell: false };
   for (const key of ['cwd', 'env', 'uid', 'gid', 'windowsHide', 'detached']) {
     if (options[key] !== undefined) spawnOptions[key] = options[key];
   }
+  if (spawnOptions.detached === undefined && platform !== 'win32') spawnOptions.detached = true;
   return spawnOptions;
 }
 
@@ -87,29 +88,36 @@ function runBoundedTerminationCommand(spawnFn, command, args, timeoutMs) {
 async function terminateProcessTree(child, {
   platform,
   spawnFn,
+  processKillFn,
   commandTimeoutMs,
   detached,
   isClosed,
 }) {
-  if (isClosed()) return;
+  if (isClosed()) return true;
   if (platform === 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
-    await runBoundedTerminationCommand(
+    return runBoundedTerminationCommand(
       spawnFn,
       'taskkill.exe',
       ['/PID', String(child.pid), '/T', '/F'],
       commandTimeoutMs,
     );
-    return;
   }
+  if (platform === 'win32') return false;
   if (platform !== 'win32' && detached === true && Number.isInteger(child.pid) && child.pid > 0) {
     try {
-      process.kill(-child.pid, 'SIGTERM');
-      return;
+      processKillFn(-child.pid, 'SIGTERM');
+      return true;
     } catch {
-      // Fall back to the direct child when it is no longer a process-group leader.
+      return isClosed();
     }
   }
-  try { child.kill('SIGTERM'); } catch { /* the child may already have exited */ }
+  return false;
+}
+
+function waitForManualTermination() {
+  return new Promise(() => {
+    setInterval(() => {}, 24 * 60 * 60 * 1_000);
+  });
 }
 
 export class CommandRunner {
@@ -117,6 +125,8 @@ export class CommandRunner {
     spawnFn = spawn,
     terminationFn,
     terminationSpawnFn = spawn,
+    processKillFn = process.kill.bind(process),
+    unsafeTerminationWaitFn = waitForManualTermination,
     platform = process.platform,
     terminationCommandTimeoutMs = DEFAULT_TERMINATION_COMMAND_TIMEOUT_MS,
     terminationConfirmationMs = DEFAULT_TERMINATION_CONFIRMATION_MS,
@@ -126,6 +136,8 @@ export class CommandRunner {
     this.spawnFn = spawnFn;
     this.terminationFn = terminationFn;
     this.terminationSpawnFn = terminationSpawnFn;
+    this.processKillFn = processKillFn;
+    this.unsafeTerminationWaitFn = unsafeTerminationWaitFn;
     this.platform = platform;
     this.terminationCommandTimeoutMs = positiveDuration(terminationCommandTimeoutMs, DEFAULT_TERMINATION_COMMAND_TIMEOUT_MS);
     this.terminationConfirmationMs = positiveDuration(terminationConfirmationMs, DEFAULT_TERMINATION_CONFIRMATION_MS);
@@ -136,7 +148,7 @@ export class CommandRunner {
   run(command, args = [], options = {}) {
     const timeoutMs = options.timeoutMs;
     const maxOutputBytes = options.maxOutputBytes ?? options.maxCaptureBytes ?? this.maxOutputBytes;
-    const spawnOptions = spawnOptionsFrom(options);
+    const spawnOptions = spawnOptionsFrom(options, this.platform);
     const redact = createRedactor([...this.sensitiveValues, ...(options.sensitiveValues ?? [])]);
     const abortSignal = options.signal;
 
@@ -191,22 +203,38 @@ export class CommandRunner {
         if (timer) clearTimeout(timer);
         if (abortHandler && abortSignal) abortSignal.removeEventListener('abort', abortHandler);
         void (async () => {
+          let treeTerminationConfirmed = false;
           try {
             const terminate = this.terminationFn ?? ((target, context) => terminateProcessTree(target, context));
-            await terminate(child, {
+            treeTerminationConfirmed = await terminate(child, {
               platform: this.platform,
               spawnFn: this.terminationSpawnFn,
+              processKillFn: this.processKillFn,
               commandTimeoutMs: this.terminationCommandTimeoutMs,
               detached: spawnOptions.detached,
               isClosed: () => closed,
-            });
+            }) === true;
           } catch {
             // Termination errors can contain secrets and are never surfaced.
           }
+          if (!treeTerminationConfirmed) {
+            await this.unsafeTerminationWaitFn();
+            return;
+          }
           if (!closed) await waitForClose(this.terminationConfirmationMs);
-          if (!closed) {
-            try { child.kill('SIGKILL'); } catch { /* the child may already have exited */ }
-            await waitForClose(this.terminationConfirmationMs);
+          if (!closed && this.platform !== 'win32' && spawnOptions.detached === true && Number.isInteger(child.pid) && child.pid > 0) {
+            let groupKillConfirmed = false;
+            try {
+              this.processKillFn(-child.pid, 'SIGKILL');
+              groupKillConfirmed = true;
+            } catch {
+              groupKillConfirmed = closed;
+            }
+            if (!groupKillConfirmed) {
+              await this.unsafeTerminationWaitFn();
+              return;
+            }
+            if (!closed) await waitForClose(this.terminationConfirmationMs);
           }
           if (!closed) await closedPromise;
           const captured = output();
