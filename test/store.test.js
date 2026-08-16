@@ -240,3 +240,100 @@ test('migrates released legacy claims to failed without exposing released in the
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('renews a live execution lease and fences an expired token from state transitions', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-lease-clock-'));
+  const path = join(directory, 'state.sqlite');
+  let currentTime = Date.parse('2026-01-01T00:00:00.000Z');
+  const store = PatchPoolStore.open(path, {
+    clock: () => currentTime,
+    randomId: () => 'lease-token-one',
+  });
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 14, workerId: 'worker-a' });
+    const lease = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100 });
+    assert.equal(lease.expiresAt, '2026-01-01T00:00:00.100Z');
+
+    currentTime += 75;
+    const renewed = store.renewExecutionLease(claim.id, 'worker-a', lease.token, { ttlMs: 100 });
+    assert.equal(renewed.expiresAt, '2026-01-01T00:00:00.175Z');
+    store.assertExecutionLease(claim.id, 'worker-a', lease.token);
+
+    currentTime += 101;
+    assert.throws(
+      () => store.assertExecutionLease(claim.id, 'worker-a', lease.token),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.throws(
+      () => store.transitionClaimWithLease(claim.id, 'running', { branch: 'stale' }, lease),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.equal(store.getClaim(claim.id).state, 'claimed');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired lease holder cannot renew or overwrite after a replacement token is acquired', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-lease-takeover-'));
+  const path = join(directory, 'state.sqlite');
+  let currentTime = 1_000;
+  let tokenNumber = 0;
+  const store = PatchPoolStore.open(path, {
+    clock: () => currentTime,
+    randomId: () => `lease-token-${++tokenNumber}`,
+  });
+  try {
+    const repo = store.registerRepository(approvedRepo());
+    const claim = store.claimIssue({ repoId: repo.id, issueNumber: 15, workerId: 'worker-a' });
+    const stale = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 10 });
+    currentTime += 11;
+    const replacement = store.acquireExecutionLease(claim.id, 'worker-a', { ttlMs: 100 });
+    assert.notEqual(replacement.token, stale.token);
+    assert.throws(
+      () => store.renewExecutionLease(claim.id, 'worker-a', stale.token, { ttlMs: 100 }),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.throws(
+      () => store.transitionClaimWithLease(claim.id, 'running', { branch: 'stale' }, stale),
+      error => error.code === 'LEASE_LOST',
+    );
+    const running = store.transitionClaimWithLease(claim.id, 'running', { branch: 'current' }, replacement);
+    assert.equal(running.branch, 'current');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy workflow migration leaves execution lease foreign keys pointing at claims', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-legacy-lease-fk-'));
+  const path = join(directory, 'state.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+    INSERT INTO schema_meta VALUES (1, 1);
+    CREATE TABLE repositories (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL COLLATE NOCASE UNIQUE, active INTEGER NOT NULL DEFAULT 1, is_public INTEGER NOT NULL DEFAULT 1, config_digest TEXT NOT NULL, verification_argv TEXT NOT NULL, required_label TEXT, blocking_labels TEXT NOT NULL DEFAULT '[]', policy_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id INTEGER NOT NULL, issue_number INTEGER NOT NULL, worker_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed','working','verifying','completed','failed','released')), fields_json TEXT NOT NULL DEFAULT '{}', claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX claims_one_active_issue ON claims(repo_id, issue_number) WHERE state IN ('claimed','working','verifying');
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, claim_id INTEGER NOT NULL, event_type TEXT NOT NULL DEFAULT 'claimed', payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    CREATE TABLE execution_leases (claim_id INTEGER PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE, worker_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE, acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+    INSERT INTO repositories VALUES (1, 'octo/example', 1, 1, 'sha256:one', '["npm","test"]', NULL, '[]', '{}', '2026-01-01', '2026-01-01');
+    INSERT INTO claims VALUES (1, 1, 16, 'worker-a', 'working', '{}', '2026-01-01', '2026-01-01');
+  `);
+  legacy.close();
+
+  const store = PatchPoolStore.open(path);
+  try {
+    const foreignKeys = store.db.prepare('PRAGMA foreign_key_list(execution_leases)').all();
+    assert.deepEqual(foreignKeys.map(key => key.table), ['claims']);
+    const lease = store.acquireExecutionLease(1, 'worker-a', { ttlMs: 1_000 });
+    assert.ok(lease.token);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

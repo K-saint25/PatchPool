@@ -94,10 +94,14 @@ function pullRequestRepository(pr, side) {
 }
 
 function remoteMatches(value, repository) {
-  const text = String(value ?? '').trim().replace(/\r?\n/g, '');
+  const text = String(value ?? '').trim();
   const ssh = text.match(/^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/i);
   const https = text.match(/^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/i);
   return (ssh?.[1] ?? https?.[1]) === repository;
+}
+
+function remoteUrls(stdout) {
+  return String(stdout ?? '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
 }
 
 function validatePullRequest(pr, repository, base, branch, issueNumberValue) {
@@ -133,6 +137,10 @@ export class IssueWorkflow {
     hooksDirectoryFactory = defaultTempDirectoryFactory,
     cleanupMaxRetries = 3,
     cleanupRetryDelay = 25,
+    leaseTtlMs = 300_000,
+    leaseHeartbeatMs = Math.max(1_000, Math.floor(leaseTtlMs / 3)),
+    setIntervalFn = setInterval,
+    clearIntervalFn = clearInterval,
   } = {}) {
     if (!store || typeof store.getRepository !== 'function' || typeof store.claimIssue !== 'function' || typeof store.transitionClaim !== 'function') throw new TypeError('IssueWorkflow requires a PatchPoolStore');
     if (!github) throw new TypeError('IssueWorkflow requires a GitHubClient');
@@ -154,6 +162,13 @@ export class IssueWorkflow {
     this.hooksDirectoryFactory = hooksDirectoryFactory;
     this.cleanupMaxRetries = cleanupMaxRetries;
     this.cleanupRetryDelay = cleanupRetryDelay;
+    if (!Number.isFinite(leaseTtlMs) || leaseTtlMs <= 0 || !Number.isFinite(leaseHeartbeatMs) || leaseHeartbeatMs <= 0 || leaseHeartbeatMs >= leaseTtlMs) {
+      throw new TypeError('IssueWorkflow requires a positive lease heartbeat interval shorter than its TTL');
+    }
+    this.leaseTtlMs = leaseTtlMs;
+    this.leaseHeartbeatMs = leaseHeartbeatMs;
+    this.setIntervalFn = setIntervalFn;
+    this.clearIntervalFn = clearIntervalFn;
   }
 
   async command(args, cwd, code, operation) {
@@ -240,16 +255,67 @@ export class IssueWorkflow {
     return { repository, issue };
   }
 
-  async transition(claim, state, fields = {}) {
-    return this.store.transitionClaim(claim.id, state, { ...fields, updatedAt: this.clock() });
+  assertLease(controller) {
+    if (!controller?.lease) throw new PatchPoolError('LEASE_LOST', 'Execution lease is unavailable');
+    if (controller.error) throw controller.error;
+    return this.store.assertExecutionLease(controller.lease.claimId, controller.lease.workerId, controller.lease.token);
   }
 
-  async fail(claim, error) {
+  async withLease(controller, operation) {
+    this.assertLease(controller);
+    try {
+      const result = await operation();
+      this.assertLease(controller);
+      return result;
+    } catch (error) {
+      this.assertLease(controller);
+      throw error;
+    }
+  }
+
+  startLeaseHeartbeat(lease) {
+    const controller = { lease, error: null, timer: null };
+    controller.timer = this.setIntervalFn(() => {
+      if (controller.error) return;
+      try {
+        controller.lease = this.store.renewExecutionLease(
+          controller.lease.claimId,
+          controller.lease.workerId,
+          controller.lease.token,
+          { ttlMs: this.leaseTtlMs },
+        );
+      } catch (cause) {
+        controller.error = asError(cause, 'LEASE_LOST');
+      }
+    }, this.leaseHeartbeatMs);
+    controller.timer?.unref?.();
+    return controller;
+  }
+
+  stopLeaseHeartbeat(controller) {
+    if (controller?.timer) this.clearIntervalFn(controller.timer);
+  }
+
+  async transition(claim, state, fields = {}, controller) {
+    this.assertLease(controller);
+    const result = this.store.transitionClaimWithLease(claim.id, state, { ...fields, updatedAt: this.clock() }, controller.lease);
+    this.assertLease(controller);
+    return result;
+  }
+
+  async restart(claim, fields, controller) {
+    this.assertLease(controller);
+    const result = this.store.restartClaimWithLease(claim.id, fields, controller.lease);
+    this.assertLease(controller);
+    return result;
+  }
+
+  async fail(claim, error, controller) {
     if (!claim) return;
     const current = this.store.getClaim?.(claim.id);
     if (!current || current.state === 'pr_opened') return;
     try {
-      this.store.transitionClaim(claim.id, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() });
+      await this.transition(current, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() }, controller);
     } catch {
       // Preserve the original workflow error if the store itself is unavailable.
     }
@@ -273,9 +339,13 @@ export class IssueWorkflow {
 
   async verifyRemote(directory, remoteName, repository) {
     const options = { cwd: directory, env: sanitizeEnvironment(this.environment) };
-    const fetchResult = await this.invoke('git', ['remote', 'get-url', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git fetch remote');
-    const pushResult = await this.invoke('git', ['remote', 'get-url', '--push', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git push remote');
-    if (!remoteMatches(fetchResult.stdout, repository) || !remoteMatches(pushResult.stdout, repository)) throw new PatchPoolError('WORKFLOW_REMOTE_MISMATCH', 'Local Git fetch and push remotes must match the approved repository');
+    const fetchResult = await this.invoke('git', ['remote', 'get-url', '--all', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git fetch remote');
+    const pushResult = await this.invoke('git', ['remote', 'get-url', '--push', '--all', remoteName], options, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git push remote');
+    const fetchUrls = remoteUrls(fetchResult.stdout);
+    const pushUrls = remoteUrls(pushResult.stdout);
+    if (fetchUrls.length === 0 || pushUrls.length === 0 || !fetchUrls.every(url => remoteMatches(url, repository)) || !pushUrls.every(url => remoteMatches(url, repository))) {
+      throw new PatchPoolError('WORKFLOW_REMOTE_MISMATCH', 'Every local Git fetch and push URL must match the approved repository');
+    }
   }
 
   async reusableCommittedWorkspace(directory, commitSha) {
@@ -304,10 +374,10 @@ export class IssueWorkflow {
     try { await this.cleanup(path, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { throw new PatchPoolError(code, 'Unable to clean up the temporary workflow directory'); }
   }
 
-  async persistCleanupFailure(claim) {
+  async persistCleanupFailure(claim, controller) {
     if (!claim) return;
     try {
-      this.store.transitionClaim(claim.id, 'failed', { errorCode: 'WORKFLOW_CLEANUP_FAILED', failedAt: this.clock() });
+      await this.transition(claim, 'failed', { errorCode: 'WORKFLOW_CLEANUP_FAILED', failedAt: this.clock() }, controller);
     } catch {
       // The cleanup error remains the observed result even if persistence is unavailable.
     }
@@ -326,7 +396,7 @@ export class IssueWorkflow {
     let commitSha;
     let pr;
     let branch;
-    let executionLease;
+    let leaseController;
     try {
       const canonical = await this.github.getRepository(fullName);
       if (canonical?.fullName !== fullName || canonical?.public === false || canonical?.isPrivate === true || canonical?.archived === true || canonical?.isArchived === true || ['private', 'internal'].includes(String(canonical?.visibility ?? '').toLowerCase())) throw new PatchPoolError('WORKFLOW_REPOSITORY_INELIGIBLE', `Repository is not eligible: ${fullName}`);
@@ -343,7 +413,9 @@ export class IssueWorkflow {
       const number = issueNumber(issue, requestedIssueNumber);
       claim = this.store.claimIssue({ repoId: approved.id, issueNumber: number, workerId: this.workerId });
       if (typeof this.store.acquireExecutionLease === 'function') {
-        executionLease = this.store.acquireExecutionLease(claim.id, this.workerId);
+        const lease = this.store.acquireExecutionLease(claim.id, this.workerId, { ttlMs: this.leaseTtlMs });
+        leaseController = this.startLeaseHeartbeat(lease);
+        this.assertLease(leaseController);
       }
 
       const refreshed = await this.refresh(fullName, number, { ...approved, ...canonical });
@@ -351,48 +423,48 @@ export class IssueWorkflow {
       const base = refreshed.repository.defaultBranch ?? canonical.defaultBranch ?? 'main';
       if (claim.state === 'pr_opened') return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha: claim.commitSha, prUrl: claim.prUrl, workspace: keepWorkspace ? claim.workspace : undefined };
       if (claim.state === 'pushed') {
-        pr = await this.openPullRequest({ fullName, base, branch, number, title: refreshed.issue.title, publish });
-        claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() });
+        pr = await this.withLease(leaseController, () => this.openPullRequest({ fullName, base, branch, number, title: refreshed.issue.title, publish }));
+        claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() }, leaseController);
         return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha: claim.commitSha, prUrl: pr.url };
       }
       let reuseCommitted = false;
       if (claim.state === 'committed' && claim.workspace) {
         reuseCommitted = await this.reusableCommittedWorkspace(claim.workspace, claim.commitSha);
         if (reuseCommitted) workspace = claim.workspace;
-        else claim = this.store.restartClaim ? this.store.restartClaim(claim.id, { restartAt: this.clock() }) : await this.transition(claim, 'running', { restartAt: this.clock() });
+        else claim = await this.restart(claim, { restartAt: this.clock() }, leaseController);
       }
-      if (!workspace) workspace = await this.tempDirectoryFactory(`patchpool-${number}-${String(claim.id ?? this.randomId())}-`);
+      if (!workspace) workspace = await this.withLease(leaseController, () => this.tempDirectoryFactory(`patchpool-${number}-${String(claim.id ?? this.randomId())}-`));
       if (!reuseCommitted) {
         await this.ensureEmptyWorkspace(workspace);
-        await this.github.clone(fullName, workspace);
-        await this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch');
-        if (claim.state === 'claimed' || claim.state === 'running') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
+        await this.withLease(leaseController, () => this.github.clone(fullName, workspace));
+        await this.withLease(leaseController, () => this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch'));
+        if (claim.state === 'claimed' || claim.state === 'running') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() }, leaseController);
       }
 
       if (claim.state !== 'committed') {
         const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
-        await this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs, env: sanitizeEnvironment(this.environment) });
+        await this.withLease(leaseController, () => this.codex.implement({ cwd: workspace, prompt, timeoutMs: this.codexTimeoutMs, env: sanitizeEnvironment(this.environment) }));
         const afterCodex = await this.status(workspace);
         if (afterCodex.paths.length === 0) throw new PatchPoolError('WORKFLOW_NO_CHANGES', 'Codex produced no worktree changes');
         const beforeVerification = await this.fingerprint(workspace, afterCodex);
         await this.invoke('git', ['diff', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Git diff check failed');
         const verification = [...approved.verificationArgv];
         if (!verification.length || verification.some(argument => typeof argument !== 'string' || !argument)) throw new PatchPoolError('WORKFLOW_INVALID_VERIFICATION', 'Repository verification argv is invalid');
-        await this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed');
+        await this.withLease(leaseController, () => this.invoke(verification[0], verification.slice(1), { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_VERIFICATION_FAILED', 'Approved verification command failed'));
         const afterVerification = await this.status(workspace);
         const afterFingerprint = await this.fingerprint(workspace, afterVerification);
         if (!sameSet(new Set(beforeVerification.keys()), new Set(afterFingerprint.keys())) || [...beforeVerification].some(([path, digest]) => afterFingerprint.get(path) !== digest)) throw new PatchPoolError('WORKFLOW_VERIFICATION_MUTATED', 'Verification changed the worktree');
-        claim = await this.transition(claim, 'verified', { verifiedAt: this.clock() });
+        claim = await this.transition(claim, 'verified', { verifiedAt: this.clock() }, leaseController);
       }
 
       if (!publish) return { state: claim.state, claimId: claim.id, issueNumber: number, branch, workspace: keepWorkspace ? workspace : undefined };
-      hooksDirectory = await this.hooksDirectoryFactory('patchpool-hooks-');
-      await this.command(['add', '-A'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to stage the worktree changes');
+      hooksDirectory = await this.withLease(leaseController, () => this.hooksDirectoryFactory('patchpool-hooks-'));
+      await this.withLease(leaseController, () => this.command(['add', '-A'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to stage the worktree changes'));
       await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, '-c', 'commit.gpgSign=false', 'diff', '--cached', '--check'], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_DIFF_CHECK_FAILED', 'Staged diff check failed');
       if (claim.state === 'verified') {
-        await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, '-c', 'commit.gpgSign=false', 'commit', '--no-verify', '-m', `PatchPool: resolve issue #${number}`], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_COMMIT_FAILED', 'Unable to commit the worktree changes');
+        await this.withLease(leaseController, () => this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, '-c', 'commit.gpgSign=false', 'commit', '--no-verify', '-m', `PatchPool: resolve issue #${number}`], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_COMMIT_FAILED', 'Unable to commit the worktree changes'));
         commitSha = (await this.command(['rev-parse', 'HEAD'], workspace, 'WORKFLOW_COMMIT_FAILED', 'Unable to resolve the commit SHA')).stdout.trim();
-        claim = await this.transition(claim, 'committed', { commitSha, workspace, committedAt: this.clock() });
+        claim = await this.transition(claim, 'committed', { commitSha, workspace, committedAt: this.clock() }, leaseController);
       } else commitSha = claim.commitSha;
       const beforePush = await this.refresh(fullName, number, { ...approved, ...canonical });
       const pushPermission = await this.github.getPushRemote({ fullName });
@@ -400,30 +472,46 @@ export class IssueWorkflow {
       const remoteName = pushPermission.remoteName;
       if (typeof remoteName !== 'string' || !/^[A-Za-z0-9._-]+$/.test(remoteName)) throw new PatchPoolError('WORKFLOW_PUSH_PERMISSION', 'Push remote name is invalid');
       await this.verifyRemote(workspace, remoteName, fullName);
-      await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, 'push', '--set-upstream', remoteName, branch], { cwd: workspace, env: sanitizeEnvironment(this.environment, { push: true }) }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch');
-      claim = await this.transition(claim, 'pushed', { pushedAt: this.clock() });
+      await this.withLease(leaseController, () => this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, 'push', '--set-upstream', remoteName, branch], { cwd: workspace, env: sanitizeEnvironment(this.environment, { push: true }) }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch'));
+      claim = await this.transition(claim, 'pushed', { pushedAt: this.clock() }, leaseController);
       if (!publish) return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, workspace: keepWorkspace ? workspace : undefined };
-      pr = await this.openPullRequest({ fullName, base: beforePush.repository.defaultBranch ?? base, branch, number, title: beforePush.issue.title ?? issue.title, publish });
-      claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() });
+      pr = await this.withLease(leaseController, () => this.openPullRequest({ fullName, base: beforePush.repository.defaultBranch ?? base, branch, number, title: beforePush.issue.title ?? issue.title, publish }));
+      claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() }, leaseController);
       return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, prUrl: pr.url, workspace: keepWorkspace ? workspace : undefined };
     } catch (cause) {
-      const error = asError(cause);
-      if (executionLease) await this.fail(claim, error);
+      let error = asError(cause);
+      if (leaseController) {
+        try { this.assertLease(leaseController); } catch (lost) { error = asError(lost, 'LEASE_LOST'); }
+      }
+      if (leaseController && error.code !== 'LEASE_LOST') await this.fail(claim, error, leaseController);
       throw error;
     } finally {
       let cleanupFailure;
-      if (hooksDirectory) {
-        try { await this.cleanup(hooksDirectory, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { cleanupFailure = true; }
+      let cleanupLeaseError;
+      let ownsLease = false;
+      if (leaseController) {
+        try { this.assertLease(leaseController); ownsLease = true; } catch { /* stale holders must not mutate shared state or paths */ }
       }
-      if (workspace && !keepWorkspace) {
-        try { await this.cleanup(workspace, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { cleanupFailure = true; }
+      if (ownsLease && hooksDirectory) {
+        try { await this.withLease(leaseController, () => this.cleanup(hooksDirectory, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay })); } catch (error) {
+          if (error?.code === 'LEASE_LOST') cleanupLeaseError = error;
+          else cleanupFailure = true;
+        }
       }
-      if (cleanupFailure) {
-        await this.persistCleanupFailure(claim);
+      if (ownsLease && workspace && !keepWorkspace) {
+        try { await this.withLease(leaseController, () => this.cleanup(workspace, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay })); } catch (error) {
+          if (error?.code === 'LEASE_LOST') cleanupLeaseError = error;
+          else cleanupFailure = true;
+        }
       }
-      if (executionLease && typeof this.store.releaseExecutionLease === 'function') {
-        try { this.store.releaseExecutionLease(executionLease.claimId, executionLease.workerId, executionLease.token); } catch { /* lease expiry remains the recovery path */ }
+      if (cleanupFailure && ownsLease) {
+        await this.persistCleanupFailure(claim, leaseController);
       }
+      this.stopLeaseHeartbeat(leaseController);
+      if (leaseController?.lease && typeof this.store.releaseExecutionLease === 'function') {
+        try { this.store.releaseExecutionLease(leaseController.lease.claimId, leaseController.lease.workerId, leaseController.lease.token); } catch { /* lease expiry remains the recovery path */ }
+      }
+      if (cleanupLeaseError) throw cleanupLeaseError;
       if (cleanupFailure) throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
     }
   }

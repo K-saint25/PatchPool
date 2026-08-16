@@ -368,8 +368,8 @@ test('execution lease prevents concurrent same-worker workflows from running Cod
 test('restart from a non-reusable committed claim clears stage-specific metadata', async () => {
   const setupState = setup();
   const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
-  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree' });
-  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree', startedAt: 'old-start', errorCode: 'old-error' });
+  setupState.store.transitionClaim(claim.id, 'verified', { verifiedAt: 'old-verify' });
   setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'old-sha', committedAt: 'old-time', workspace: 'missing-worktree' });
   setupState.github.clone = async () => {};
   setupState.runner.run = async (command, args) => {
@@ -377,12 +377,145 @@ test('restart from a non-reusable committed claim clears stage-specific metadata
     return { exitCode: 0, stdout: command === 'git' && args[0] === 'status' ? ' M src/app.js\n' : '', stderr: '' };
   };
   const { IssueWorkflow } = await import('../src/workflow.js');
-  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'fresh-worktree', cleanup: async () => {} });
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', clock: () => 'new-time', tempDirectoryFactory: async () => 'fresh-worktree', cleanup: async () => {} });
   const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
   assert.equal(result.state, 'verified');
   const fields = setupState.store.getClaim(claim.id);
   assert.equal(fields.commitSha, undefined);
   assert.equal(fields.committedAt, undefined);
+  assert.equal(fields.verifiedAt, 'new-time');
+  assert.equal(fields.startedAt, 'new-time');
+  assert.equal(fields.errorCode, undefined);
   assert.equal(fields.workspace, 'fresh-worktree');
+  setupState.store.close();
+});
+
+test('rejects every configured push URL when any one targets a different repository', async () => {
+  const setupState = setup();
+  let pushed = false;
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'remote' && args.includes('--push')) {
+      return {
+        exitCode: 0,
+        stdout: args.includes('--all')
+          ? 'https://github.com/octo/example.git\nhttps://github.com/attacker/repo.git\n'
+          : 'https://github.com/octo/example.git\n',
+        stderr: '',
+      };
+    }
+    if (command === 'git' && args.includes('push')) pushed = true;
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }),
+    error => error.code === 'WORKFLOW_REMOTE_MISMATCH',
+  );
+  assert.equal(pushed, false);
+  setupState.store.close();
+});
+
+test('rejects a remote with no configured push URL before pushing', async () => {
+  const setupState = setup();
+  let pushed = false;
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'remote' && args.includes('--push')) return { exitCode: 0, stdout: '\n', stderr: '' };
+    if (command === 'git' && args.includes('push')) pushed = true;
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }),
+    error => error.code === 'WORKFLOW_REMOTE_MISMATCH',
+  );
+  assert.equal(pushed, false);
+  setupState.store.close();
+});
+
+test('a workflow that loses its lease after Codex cannot verify or overwrite the replacement holder state', async () => {
+  const setupState = setup();
+  let capturedLease;
+  const acquire = setupState.store.acquireExecutionLease.bind(setupState.store);
+  setupState.store.acquireExecutionLease = (...args) => {
+    capturedLease = acquire(...args);
+    return capturedLease;
+  };
+  setupState.codex.implement = async () => {
+    setupState.store.releaseExecutionLease(capturedLease.claimId, capturedLease.workerId, capturedLease.token);
+    acquire(capturedLease.claimId, capturedLease.workerId, { ttlMs: 60_000 });
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    error => error.code === 'LEASE_LOST',
+  );
+  const claim = setupState.store.getClaim(capturedLease.claimId);
+  assert.equal(claim.state, 'running');
+  assert.equal(setupState.calls.some(call => call[0] === 'run' && call[1] === 'npm'), false);
+  setupState.store.close();
+});
+
+test('heartbeat renews the lease while Codex is running longer than its TTL', async () => {
+  const setupState = setup();
+  let capturedLease;
+  let finishCodex;
+  const acquire = setupState.store.acquireExecutionLease.bind(setupState.store);
+  setupState.store.acquireExecutionLease = (claimId, workerId) => {
+    capturedLease = acquire(claimId, workerId, { ttlMs: 40 });
+    return capturedLease;
+  };
+  setupState.codex.implement = async () => new Promise(resolve => { finishCodex = resolve; });
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    workerId: 'worker-a',
+    leaseTtlMs: 40,
+    leaseHeartbeatMs: 5,
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {},
+  });
+  const running = workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
+  while (!finishCodex) await new Promise(resolve => setTimeout(resolve, 1));
+  await new Promise(resolve => setTimeout(resolve, 90));
+  assert.throws(
+    () => acquire(capturedLease.claimId, capturedLease.workerId, { ttlMs: 40 }),
+    error => error.code === 'LEASE_BUSY',
+  );
+  finishCodex();
+  const result = await running;
+  assert.equal(result.state, 'verified');
+  setupState.store.close();
+});
+
+test('lease loss during cleanup is reported as fencing and cannot overwrite claim state', async () => {
+  const setupState = setup();
+  let capturedLease;
+  const acquire = setupState.store.acquireExecutionLease.bind(setupState.store);
+  setupState.store.acquireExecutionLease = (...args) => {
+    capturedLease = acquire(...args);
+    return capturedLease;
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({
+    ...setupState,
+    workerId: 'worker-a',
+    tempDirectoryFactory: async () => 'worktree',
+    cleanup: async () => {
+      setupState.store.releaseExecutionLease(capturedLease.claimId, capturedLease.workerId, capturedLease.token);
+      acquire(capturedLease.claimId, capturedLease.workerId, { ttlMs: 60_000 });
+    },
+  });
+  await assert.rejects(
+    () => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }),
+    error => error.code === 'LEASE_LOST',
+  );
+  assert.equal(setupState.store.getClaim(capturedLease.claimId).state, 'verified');
   setupState.store.close();
 });
