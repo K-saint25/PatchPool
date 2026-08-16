@@ -1,12 +1,13 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import * as defaultFilesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { PatchPoolError } from './errors.js';
 import { evaluateIssueEligibility } from './policy.js';
 import { buildImplementationPrompt } from './prompt.js';
+import { resolveWorkerId } from './worker.js';
 
 const SECRET_FILE = /(?:^|[\\/])(?:\.env(?:\.|$)|\.ssh(?:[\\/]|$)|\.aws(?:[\\/]|$)|\.git-credentials(?:\.|$)|.*\.(?:pem|key|p12|pfx)|.*id_(?:rsa|ecdsa|ed25519)(?:\.|$)|.*private[_-]?key.*|.*credentials?(?:\.|$)|.*secrets?(?:\.|$)|.*token.*)|(?:^|[\\/])\.\.(?:[\\/]|$)/i;
 
@@ -68,12 +69,13 @@ function sameSet(a, b) {
   return true;
 }
 
-function sanitizeEnvironment(source = process.env) {
+function sanitizeEnvironment(source = process.env, { push = false } = {}) {
   const allow = /^(?:PATH|PATHEXT|SystemRoot|SYSTEMROOT|TEMP|TMP|TMPDIR|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|CODEX_HOME|ComSpec|COMSPEC|windir|USER|USERNAME|LANG|LC_[A-Z_]+|NODE_PATH)$/i;
+  const pushAllow = /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|SSH_ASKPASS|GIT_SSH|GIT_SSH_COMMAND|GIT_TERMINAL_PROMPT)$/i;
   const secret = /(?:GH|GITHUB|OPENAI|AWS|AZURE|GOOGLE|CLOUD|TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)/i;
   const result = {};
   for (const [name, value] of Object.entries(source ?? {})) {
-    if (allow.test(name) && !secret.test(name) && value !== undefined) result[name] = String(value);
+    if ((allow.test(name) || (push && pushAllow.test(name))) && !secret.test(name) && value !== undefined) result[name] = String(value);
   }
   return result;
 }
@@ -82,13 +84,20 @@ function defaultTempDirectoryFactory(prefix) {
   return mkdtemp(join(tmpdir(), prefix));
 }
 
-function defaultCleanup(directory) {
-  return rm(directory, { recursive: true, force: true });
+function defaultCleanup(directory, options = {}) {
+  return rm(directory, { recursive: true, force: true, maxRetries: options.maxRetries ?? 3, retryDelay: options.retryDelay ?? 25 });
 }
 
 function pullRequestRepository(pr, side) {
   const value = side === 'base' ? (pr?.baseRepository ?? pr?.baseRepo ?? pr?.base?.repository ?? pr?.base?.repo) : (pr?.headRepository ?? pr?.headRepo ?? pr?.head?.repository ?? pr?.head?.repo);
   return value?.fullName ?? value?.nameWithOwner ?? value?.full_name;
+}
+
+function remoteMatches(value, repository) {
+  const text = String(value ?? '').trim().replace(/\r?\n/g, '');
+  const ssh = text.match(/^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/i);
+  const https = text.match(/^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/i);
+  return (ssh?.[1] ?? https?.[1]) === repository;
 }
 
 function validatePullRequest(pr, repository, base, branch, issueNumberValue) {
@@ -122,6 +131,8 @@ export class IssueWorkflow {
     filesystem = defaultFilesystem,
     environment = process.env,
     hooksDirectoryFactory = defaultTempDirectoryFactory,
+    cleanupMaxRetries = 3,
+    cleanupRetryDelay = 25,
   } = {}) {
     if (!store || typeof store.getRepository !== 'function' || typeof store.claimIssue !== 'function' || typeof store.transitionClaim !== 'function') throw new TypeError('IssueWorkflow requires a PatchPoolStore');
     if (!github) throw new TypeError('IssueWorkflow requires a GitHubClient');
@@ -133,7 +144,7 @@ export class IssueWorkflow {
     this.runner = runner;
     this.tempDirectoryFactory = tempDirectoryFactory;
     this.cleanup = cleanup;
-    this.workerId = workerId ?? `worker-${randomId()}`;
+    this.workerId = workerId ?? resolveWorkerId();
     this.clock = clock;
     this.randomId = randomId;
     this.promptBuilder = promptBuilder;
@@ -141,6 +152,8 @@ export class IssueWorkflow {
     this.filesystem = filesystem;
     this.environment = environment;
     this.hooksDirectoryFactory = hooksDirectoryFactory;
+    this.cleanupMaxRetries = cleanupMaxRetries;
+    this.cleanupRetryDelay = cleanupRetryDelay;
   }
 
   async command(args, cwd, code, operation) {
@@ -178,7 +191,7 @@ export class IssueWorkflow {
       if (SECRET_FILE.test(path)) throw new PatchPoolError('WORKFLOW_SUSPICIOUS_FILE', 'Codex produced a suspicious secret-like filename');
       const absolute = resolve(root, path);
       const relativePath = relative(root, absolute);
-      if (!relativePath || relativePath.startsWith('..') || relativePath.includes('..' + '\\') || relativePath.includes('../') || absolute === root) throw new PatchPoolError('WORKFLOW_PATH_ESCAPE', 'Changed path escapes the isolated worktree');
+      if (isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path) || !relativePath || relativePath.startsWith('..') || relativePath.includes('..' + '\\') || relativePath.includes('../') || absolute === root) throw new PatchPoolError('WORKFLOW_PATH_ESCAPE', 'Changed path escapes the isolated worktree');
       let stat;
       try { stat = await this.filesystem.lstat(absolute); } catch (error) {
         if (error?.code === 'ENOENT') { result.set(path, 'missing'); continue; }
@@ -234,7 +247,7 @@ export class IssueWorkflow {
   async fail(claim, error) {
     if (!claim) return;
     const current = this.store.getClaim?.(claim.id);
-    if (!current || ['failed', 'released', 'completed', 'pr_opened'].includes(current.state)) return;
+    if (!current || ['released', 'pr_opened'].includes(current.state)) return;
     try {
       this.store.transitionClaim(claim.id, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() });
     } catch {
@@ -255,11 +268,47 @@ export class IssueWorkflow {
       if (!reconciled) throw createError;
       return validatePullRequest(reconciled, fullName, base, branch, number);
     }
-    return validatePullRequest({ ...created, body: created.body ?? body }, fullName, base, branch, number);
+    return validatePullRequest(created, fullName, base, branch, number);
+  }
+
+  async verifyRemote(directory, remoteName, repository) {
+    const result = await this.invoke('git', ['remote', 'get-url', remoteName], { cwd: directory, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_REMOTE_MISMATCH', 'Unable to resolve the local Git remote');
+    if (!remoteMatches(result.stdout, repository)) throw new PatchPoolError('WORKFLOW_REMOTE_MISMATCH', 'Local Git remote does not match the approved repository');
+  }
+
+  async reusableCommittedWorkspace(directory, commitSha) {
+    if (!directory || !commitSha) return false;
+    try {
+      const stat = await this.filesystem.lstat(directory);
+      if (!stat.isDirectory()) return false;
+      const head = (await this.command(['rev-parse', 'HEAD'], directory, 'WORKFLOW_RESUME_UNAVAILABLE', 'Unable to inspect the committed workspace')).stdout.trim();
+      return head === commitSha;
+    } catch {
+      return false;
+    }
+  }
+
+  async ensureEmptyWorkspace(directory) {
+    try {
+      const entries = await this.filesystem.readdir(directory);
+      if (entries.length > 0) throw new PatchPoolError('WORKFLOW_WORKSPACE_NOT_EMPTY', 'Temporary workspace is not empty');
+    } catch (error) {
+      if (error instanceof PatchPoolError) throw error;
+      if (error?.code !== 'ENOENT') throw new PatchPoolError('WORKFLOW_WORKSPACE_FAILED', 'Unable to inspect the temporary workspace');
+    }
   }
 
   async cleanupPath(path, code = 'WORKFLOW_CLEANUP_FAILED') {
-    try { await this.cleanup(path); } catch { throw new PatchPoolError(code, 'Unable to clean up the temporary workflow directory'); }
+    try { await this.cleanup(path, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { throw new PatchPoolError(code, 'Unable to clean up the temporary workflow directory'); }
+  }
+
+  async persistCleanupFailure(claim) {
+    if (!claim) return;
+    try {
+      this.store.transitionClaim(claim.id, 'failed', { errorCode: 'WORKFLOW_CLEANUP_FAILED', failedAt: this.clock() });
+    } catch {
+      // The cleanup error remains the observed result even if persistence is unavailable.
+    }
   }
 
   async run({ repo, issueNumber: requestedIssueNumber, publish = false, keepWorkspace = false } = {}) {
@@ -300,11 +349,19 @@ export class IssueWorkflow {
         claim = await this.transition(claim, 'pr_opened', { prUrl: pr.url, openedAt: this.clock() });
         return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha: claim.commitSha, prUrl: pr.url };
       }
-      if (claim.state === 'committed' && claim.workspace) workspace = claim.workspace;
+      let reuseCommitted = false;
+      if (claim.state === 'committed' && claim.workspace) {
+        reuseCommitted = await this.reusableCommittedWorkspace(claim.workspace, claim.commitSha);
+        if (reuseCommitted) workspace = claim.workspace;
+        else claim = this.store.restartClaim ? this.store.restartClaim(claim.id, { restartAt: this.clock() }) : await this.transition(claim, 'running', { restartAt: this.clock() });
+      }
       if (!workspace) workspace = await this.tempDirectoryFactory(`patchpool-${number}-${String(claim.id ?? this.randomId())}-`);
-      await this.github.clone(fullName, workspace);
-      await this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch');
-      if (claim.state === 'claimed') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
+      if (!reuseCommitted) {
+        await this.ensureEmptyWorkspace(workspace);
+        await this.github.clone(fullName, workspace);
+        await this.command(['switch', '-c', branch], workspace, 'WORKFLOW_BRANCH_FAILED', 'Unable to create the worker branch');
+        if (claim.state === 'claimed') claim = await this.transition(claim, 'running', { branch, workspace, startedAt: this.clock() });
+      }
 
       if (claim.state !== 'committed') {
         const prompt = this.promptBuilder({ repository: { ...approved, ...refreshed.repository, fullName }, issue: refreshed.issue, verificationArgv: [...approved.verificationArgv] });
@@ -336,7 +393,8 @@ export class IssueWorkflow {
       if (!pushPermission || pushPermission.canPush !== true) throw new PatchPoolError('WORKFLOW_PUSH_PERMISSION', `Push permission could not be verified for ${fullName}`);
       const remoteName = pushPermission.remoteName;
       if (typeof remoteName !== 'string' || !/^[A-Za-z0-9._-]+$/.test(remoteName)) throw new PatchPoolError('WORKFLOW_PUSH_PERMISSION', 'Push remote name is invalid');
-      await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, 'push', '--set-upstream', remoteName, branch], { cwd: workspace, env: sanitizeEnvironment(this.environment) }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch');
+      await this.verifyRemote(workspace, remoteName, fullName);
+      await this.invoke('git', ['-c', `core.hooksPath=${hooksDirectory}`, 'push', '--set-upstream', remoteName, branch], { cwd: workspace, env: sanitizeEnvironment(this.environment, { push: true }) }, 'WORKFLOW_PUSH_FAILED', 'Unable to push the worker branch');
       claim = await this.transition(claim, 'pushed', { pushedAt: this.clock() });
       if (!publish) return { state: claim.state, claimId: claim.id, issueNumber: number, branch, commitSha, workspace: keepWorkspace ? workspace : undefined };
       pr = await this.openPullRequest({ fullName, base: beforePush.repository.defaultBranch ?? base, branch, number, title: beforePush.issue.title ?? issue.title, publish });
@@ -349,12 +407,15 @@ export class IssueWorkflow {
     } finally {
       let cleanupFailure;
       if (hooksDirectory) {
-        try { await this.cleanup(hooksDirectory); } catch { cleanupFailure = true; }
+        try { await this.cleanup(hooksDirectory, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { cleanupFailure = true; }
       }
       if (workspace && !keepWorkspace) {
-        try { await this.cleanup(workspace); } catch { cleanupFailure = true; }
+        try { await this.cleanup(workspace, { maxRetries: this.cleanupMaxRetries, retryDelay: this.cleanupRetryDelay }); } catch { cleanupFailure = true; }
       }
-      if (cleanupFailure) throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
+      if (cleanupFailure) {
+        await this.persistCleanupFailure(claim);
+        throw new PatchPoolError('WORKFLOW_CLEANUP_FAILED', 'Unable to clean up the temporary workflow directory');
+      }
     }
   }
 }

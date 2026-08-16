@@ -3,20 +3,17 @@ import { PatchPoolError } from './errors.js';
 
 const SCHEMA_VERSION = 1;
 const ACTIVE_STATES = ['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened'];
-const STATES = new Set(['claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released']);
+const STATES = new Set(['claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released']);
 const BUSY_RETRY_ATTEMPTS = 20;
 const BUSY_RETRY_WAIT_MS = 10;
 const TRANSITIONS = new Map([
-  ['claimed', new Set(['working', 'running', 'failed', 'released'])],
-  ['working', new Set(['running', 'verifying', 'failed', 'released'])],
-  ['running', new Set(['verifying', 'verified', 'failed', 'released'])],
-  ['verifying', new Set(['verified', 'committed', 'completed', 'failed', 'released'])],
+  ['claimed', new Set(['running', 'failed', 'released'])],
+  ['running', new Set(['verified', 'failed', 'released'])],
   ['verified', new Set(['verified', 'committed', 'failed', 'released'])],
   ['committed', new Set(['pushed', 'failed', 'released'])],
   ['pushed', new Set(['pr_opened', 'failed', 'released'])],
-  ['pr_opened', new Set(['completed'])],
-  ['completed', new Set()],
-  ['failed', new Set()],
+  ['pr_opened', new Set(['failed'])],
+  ['failed', new Set(['failed'])],
   ['released', new Set()],
 ]);
 
@@ -106,7 +103,7 @@ function withImmediateTransaction(db, operation) {
 
 function migrateWorkflowStates(db) {
   const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get()?.sql ?? '';
-  if (table.includes("'running'")) return;
+  if (table.includes("'running'") && !table.includes("'working'")) return;
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     db.exec('BEGIN');
@@ -119,13 +116,15 @@ function migrateWorkflowStates(db) {
         repo_id INTEGER NOT NULL REFERENCES repositories(id),
         issue_number INTEGER NOT NULL CHECK (issue_number > 0),
         worker_id TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released')),
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released')),
         fields_json TEXT NOT NULL DEFAULT '{}',
         claimed_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       INSERT INTO claims (id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at)
-        SELECT id, repo_id, issue_number, worker_id, state, fields_json, claimed_at, updated_at FROM claims_legacy;
+        SELECT id, repo_id, issue_number, worker_id,
+          CASE state WHEN 'working' THEN 'running' WHEN 'verifying' THEN 'running' WHEN 'completed' THEN 'failed' ELSE state END,
+          fields_json, claimed_at, updated_at FROM claims_legacy;
       CREATE UNIQUE INDEX claims_one_active_issue
         ON claims(repo_id, issue_number) WHERE state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened');
       CREATE TABLE events (
@@ -183,7 +182,7 @@ export class PatchPoolStore {
         repo_id INTEGER NOT NULL REFERENCES repositories(id),
         issue_number INTEGER NOT NULL CHECK (issue_number > 0),
         worker_id TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('claimed', 'working', 'running', 'verifying', 'verified', 'committed', 'pushed', 'pr_opened', 'completed', 'failed', 'released')),
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'running', 'verified', 'committed', 'pushed', 'pr_opened', 'failed', 'released')),
         fields_json TEXT NOT NULL DEFAULT '{}',
         claimed_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -304,7 +303,9 @@ export class PatchPoolStore {
 
   transitionClaim(id, nextState, fields = {}) {
     const claimId = Number(id);
-    const state = String(nextState ?? '').toLowerCase();
+    const requestedState = String(nextState ?? '').toLowerCase();
+    const compatibilityWorking = requestedState === 'working';
+    const state = compatibilityWorking ? 'running' : requestedState;
     if (!Number.isInteger(claimId) || claimId < 1 || !STATES.has(state)) {
       throw new PatchPoolError('INVALID_TRANSITION', `Unknown claim transition state: ${nextState}`);
     }
@@ -323,12 +324,29 @@ export class PatchPoolStore {
         .run(state, JSON.stringify(merged), timestamp, claimId);
       this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
         .run(claimId, state, JSON.stringify(fields), timestamp);
-      return this.getClaim(claimId);
+      const result = this.getClaim(claimId);
+      return compatibilityWorking ? { ...result, state: 'working' } : result;
     });
   }
 
   getClaim(id) {
     return mapClaim(this.db.prepare('SELECT * FROM claims WHERE id = ?').get(Number(id)));
+  }
+
+  restartClaim(id, fields = {}) {
+    const claimId = Number(id);
+    return withImmediateTransaction(this.db, () => {
+      const current = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
+      if (!current) throw new PatchPoolError('CLAIM_NOT_FOUND', `Unknown claim id: ${claimId}`);
+      if (current.state !== 'committed') throw new PatchPoolError('INVALID_TRANSITION', `Cannot restart claim from ${current.state}`);
+      const merged = { ...json(current.fields_json, {}), ...fields };
+      const timestamp = now();
+      this.db.prepare('UPDATE claims SET state = ?, fields_json = ?, updated_at = ? WHERE id = ?')
+        .run('running', JSON.stringify(merged), timestamp, claimId);
+      this.db.prepare('INSERT INTO events (claim_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)')
+        .run(claimId, 'running', JSON.stringify(fields), timestamp);
+      return this.getClaim(claimId);
+    });
   }
 }
 

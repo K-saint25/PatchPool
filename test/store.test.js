@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import { pathToFileURL } from 'node:url';
 import { PatchPoolStore } from '../src/store.js';
@@ -157,6 +158,8 @@ test('active running and verified claims prevent a different worker from taking 
   const { store, directory } = openTempStore();
   try {
     const repo = store.registerRepository(approvedRepo());
+    const schema = store.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'claims'").get().sql;
+    assert.equal(/working|verifying|completed/.test(schema), false);
     const claim = store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-a' });
     const running = store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-8-1' });
     assert.equal(running.state, 'running');
@@ -164,6 +167,31 @@ test('active running and verified claims prevent a different worker from taking 
     const verified = store.transitionClaim(claim.id, 'verified');
     assert.equal(verified.state, 'verified');
     assert.throws(() => store.claimIssue({ repoId: repo.id, issueNumber: 8, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('migrates a legacy working claim to running without allowing a duplicate worker', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-legacy-'));
+  const path = join(directory, 'state.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+    INSERT INTO schema_meta VALUES (1, 1);
+    CREATE TABLE repositories (id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL COLLATE NOCASE UNIQUE, active INTEGER NOT NULL DEFAULT 1, is_public INTEGER NOT NULL DEFAULT 1, config_digest TEXT NOT NULL, verification_argv TEXT NOT NULL, required_label TEXT, blocking_labels TEXT NOT NULL DEFAULT '[]', policy_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id INTEGER NOT NULL, issue_number INTEGER NOT NULL, worker_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed','working','verifying','completed','failed','released')), fields_json TEXT NOT NULL DEFAULT '{}', claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX claims_one_active_issue ON claims(repo_id, issue_number) WHERE state IN ('claimed','working','verifying');
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, claim_id INTEGER NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    INSERT INTO repositories VALUES (1, 'octo/example', 1, 1, 'sha256:one', '["npm","test"]', NULL, '[]', '{}', '2026-01-01', '2026-01-01');
+    INSERT INTO claims VALUES (1, 1, 11, 'worker-a', 'working', '{}', '2026-01-01', '2026-01-01');
+  `);
+  legacy.close();
+  const store = PatchPoolStore.open(path);
+  try {
+    assert.equal(store.getClaim(1).state, 'running');
+    assert.throws(() => store.claimIssue({ repoId: 1, issueNumber: 11, workerId: 'worker-b' }), error => error.code === 'CLAIM_EXISTS');
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });

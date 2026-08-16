@@ -4,6 +4,7 @@ import { CommandRunner } from './runner.js';
 import { GitHubClient } from './github.js';
 import { CodexClient } from './codex.js';
 import { IssueWorkflow } from './workflow.js';
+import { resolveWorkerId } from './worker.js';
 
 function parseArguments(argv) {
   const positional = [];
@@ -59,7 +60,7 @@ function emit(stdout, value, json = true) {
   stdout(`${json ? JSON.stringify(value) : String(value)}\n`);
 }
 
-async function dispatch(argv, { store, stdout, workflow, github, codex, runner }) {
+async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env }) {
   const [command, maybeSubcommand, ...remaining] = argv;
   const subcommand = command === 'repo' ? maybeSubcommand : undefined;
   const rest = command === 'repo' ? remaining : [maybeSubcommand, ...remaining].filter(item => item !== undefined);
@@ -123,7 +124,9 @@ async function dispatch(argv, { store, stdout, workflow, github, codex, runner }
     const commandRunner = runner ?? new CommandRunner();
     const gh = github ?? new GitHubClient({ runner: commandRunner });
     const cx = codex ?? new CodexClient({ runner: commandRunner });
-    const worker = workflow ?? new IssueWorkflow({ store, github: gh, codex: cx, runner: commandRunner });
+    const worker = workflow ?? (workflowFactory
+      ? workflowFactory({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment) })
+      : new IssueWorkflow({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment) }));
     const result = await worker.run({ repo: fullName, issueNumber, publish: options.publish === true, keepWorkspace: options.keep_workspace === true });
     emit(stdout, result, options.json !== false);
     return result;
@@ -137,10 +140,10 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   const store = options.store ?? PatchPoolStore.open(options.dbPath ?? process.env.PATCHPOOL_DB ?? '.patchpool.sqlite');
   const stdout = options.stdout ?? (value => process.stdout.write(value));
   try {
-    return await dispatch(argv, { store, stdout, workflow: options.workflow, github: options.github, codex: options.codex, runner: options.runner });
+    return await dispatch(argv, { store, stdout, workflow: options.workflow, workflowFactory: options.workflowFactory, github: options.github, codex: options.codex, runner: options.runner, environment: options.environment ?? process.env });
   } finally {
     if (ownsStore) store.close();
   }
 }
 
-export { parseArguments };
+export { parseArguments, resolveWorkerId };

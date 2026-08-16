@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PatchPoolStore } from '../src/store.js';
-import { main } from '../src/cli.js';
+import { main, resolveWorkerId } from '../src/cli.js';
 
 function memoryStore() {
   return PatchPoolStore.open(':memory:');
@@ -27,6 +27,32 @@ test('repo add defaults verification to the Windows-safe Node test executable', 
   try {
     const result = await main(['repo', 'add', '--repo', 'octo/default', '--config-digest', 'sha256:one'], { store, stdout() {} });
     assert.deepEqual(result.verificationArgv, [process.execPath, '--test']);
+  } finally {
+    store.close();
+  }
+});
+
+test('CLI compositions reuse a stable worker ID across runs', async () => {
+  const first = resolveWorkerId({ PATCHPOOL_WORKER_ID: '' , COMPUTERNAME: 'machine-a', USERNAME: 'operator' });
+  const second = resolveWorkerId({ PATCHPOOL_WORKER_ID: '' , COMPUTERNAME: 'machine-a', USERNAME: 'operator' });
+  assert.equal(first, second);
+  assert.match(first, /^worker-[a-f0-9]{16}$/);
+});
+
+test('two CLI run compositions pass the same worker ID to the workflow', async () => {
+  const store = memoryStore();
+  const ids = [];
+  try {
+    store.registerRepository({ fullName: 'octo/composed', configDigest: 'sha256:one', verificationArgv: ['npm', 'test'] });
+    const options = {
+      store,
+      environment: { PATCHPOOL_WORKER_ID: '', COMPUTERNAME: 'machine-b', USERNAME: 'operator' },
+      stdout() {},
+      workflowFactory: input => { ids.push(input.workerId); return { run: async () => ({ state: 'verified' }) }; },
+    };
+    await main(['run', '--repo', 'octo/composed'], options);
+    await main(['run', '--repo', 'octo/composed'], options);
+    assert.equal(ids[0], ids[1]);
   } finally {
     store.close();
   }

@@ -27,6 +27,7 @@ function setup({ verificationExitCode = 0 } = {}) {
     async run(command, args, options) {
       calls.push(['run', command, args]);
       if (command === 'git' && args[0] === 'status') return { exitCode: 0, stdout: ' M src/app.js\n', stderr: '' };
+      if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
       if (command === 'git' && args[0] === 'diff') return { exitCode: 0, stdout: '', stderr: '' };
       if (command === 'npm') return { exitCode: verificationExitCode, stdout: '', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };
@@ -210,17 +211,40 @@ test('strips credential environment variables while preserving Codex operational
   const setupState = setup();
   let codexEnvironment;
   let verifierEnvironment;
+  let pushEnvironment;
   setupState.codex.implement = async options => { codexEnvironment = options.env; };
   const originalRun = setupState.runner.run;
   setupState.runner.run = async (command, args, options) => {
     if (command === 'npm') verifierEnvironment = options.env;
+    if (command === 'git' && args[0] === '-c' && args.includes('push')) pushEnvironment = options.env;
     return originalRun(command, args, options);
   };
   const { IssueWorkflow } = await import('../src/workflow.js');
-  const workflow = new IssueWorkflow({ ...setupState, environment: { PATH: 'safe', CODEX_HOME: 'codex-home', APPDATA: 'appdata', GITHUB_TOKEN: 'github-secret', OPENAI_API_KEY: 'openai-secret', AWS_SECRET_ACCESS_KEY: 'aws-secret', RANDOM_VALUE: 'drop' }, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  const workflow = new IssueWorkflow({ ...setupState, environment: { PATH: 'safe', CODEX_HOME: 'codex-home', APPDATA: 'appdata', SSH_AUTH_SOCK: 'ssh-agent', GIT_ASKPASS: 'askpass', GITHUB_TOKEN: 'github-secret', OPENAI_API_KEY: 'openai-secret', AWS_SECRET_ACCESS_KEY: 'aws-secret', RANDOM_VALUE: 'drop' }, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
   await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false });
   assert.deepEqual(codexEnvironment, { PATH: 'safe', CODEX_HOME: 'codex-home', APPDATA: 'appdata' });
   assert.deepEqual(verifierEnvironment, codexEnvironment);
+  assert.equal(pushEnvironment, undefined);
+  setupState.store.close();
+});
+
+test('push environment retains approved SSH helpers but not raw credentials', async () => {
+  const setupState = setup();
+  let pushEnvironment;
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === '-c' && args.includes('push')) pushEnvironment = options.env;
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, environment: { PATH: 'safe', SSH_AUTH_SOCK: 'ssh-agent', GIT_ASKPASS: 'askpass', SSH_ASKPASS: 'ssh-askpass', GITHUB_TOKEN: 'github-secret', OPENAI_API_KEY: 'openai-secret' }, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true });
+  assert.equal(pushEnvironment.SSH_AUTH_SOCK, 'ssh-agent');
+  assert.equal(pushEnvironment.GIT_ASKPASS, 'askpass');
+  assert.equal(pushEnvironment.SSH_ASKPASS, 'ssh-askpass');
+  assert.equal(pushEnvironment.GITHUB_TOKEN, undefined);
+  assert.equal(pushEnvironment.OPENAI_API_KEY, undefined);
   setupState.store.close();
 });
 
@@ -229,5 +253,78 @@ test('surfaces cleanup failure as a stable workflow error', async () => {
   const { IssueWorkflow } = await import('../src/workflow.js');
   const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => { throw new Error('cleanup failed'); } });
   await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: false }), error => error.code === 'WORKFLOW_CLEANUP_FAILED');
+  const failed = setupState.store.db.prepare('SELECT state, fields_json FROM claims ORDER BY id DESC LIMIT 1').get();
+  assert.equal(failed.state, 'failed');
+  assert.equal(JSON.parse(failed.fields_json).errorCode, 'WORKFLOW_CLEANUP_FAILED');
+  setupState.store.close();
+});
+
+test('committed resume reuses a matching workspace without cloning', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'worktree' });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'worktree' });
+  setupState.runner.run = async (command, args, options) => {
+    setupState.calls.push(['run', command, args]);
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  setupState.github.findPullRequest = async () => ({ url: 'https://github.com/octo/example/pull/2', isDraft: true, headRefName: 'patchpool/issue-1-1', baseRefName: 'main', baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' }, body: 'AI-assisted implementation. Closes #1' });
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', filesystem: { lstat: async () => ({ isDirectory: () => true }), realpath: async path => path, readdir: async () => [], readFile: async () => Buffer.from('') }, tempDirectoryFactory: async () => 'new-worktree', cleanup: async () => {} });
+  const result = await workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true });
+  assert.equal(result.state, 'pr_opened');
+  assert.equal(setupState.calls.some(call => call[0] === 'clone'), false);
+  setupState.store.close();
+});
+
+test('committed resume with an unusable workspace restarts from running in a fresh directory', async () => {
+  const setupState = setup();
+  const claim = setupState.store.claimIssue({ repoId: setupState.repository.id, issueNumber: 1, workerId: 'worker-a' });
+  setupState.store.transitionClaim(claim.id, 'running', { branch: 'patchpool/issue-1-1', workspace: 'missing-worktree' });
+  setupState.store.transitionClaim(claim.id, 'verified');
+  setupState.store.transitionClaim(claim.id, 'committed', { commitSha: 'abc123', workspace: 'missing-worktree' });
+  let cloned;
+  setupState.github.clone = async (name, directory) => { cloned = directory; setupState.calls.push(['clone', directory]); };
+  setupState.runner.run = async (command, args) => {
+    setupState.calls.push(['run', command, args]);
+    if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 1, stdout: '', stderr: '' };
+    return { exitCode: 0, stdout: command === 'npm' ? '' : ' M src/app.js\n', stderr: '' };
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, workerId: 'worker-a', tempDirectoryFactory: async () => 'fresh-worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_VERIFICATION_FAILED' || error.code === 'WORKFLOW_COMMIT_FAILED');
+  assert.equal(cloned, 'fresh-worktree');
+  setupState.store.close();
+});
+
+test('does not synthesize a missing remote PR body from the local request', async () => {
+  const setupState = setup();
+  setupState.github.createDraftPullRequest = async input => ({ url: 'https://github.com/octo/example/pull/4', isDraft: true, headRefName: input.branch, baseRefName: input.base, baseRepository: { fullName: 'octo/example' }, headRepository: { fullName: 'octo/example' } });
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'rev-parse') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+    if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/octo/example.git\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_PR_DISCLOSURE_MISSING');
+  setupState.store.close();
+});
+
+test('rejects a local origin remote that resolves to another repository', async () => {
+  const setupState = setup();
+  const originalRun = setupState.runner.run;
+  setupState.runner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'remote') return { exitCode: 0, stdout: 'https://github.com/other/repo.git\n', stderr: '' };
+    return originalRun(command, args, options);
+  };
+  const { IssueWorkflow } = await import('../src/workflow.js');
+  const workflow = new IssueWorkflow({ ...setupState, tempDirectoryFactory: async () => 'worktree', cleanup: async () => {} });
+  await assert.rejects(() => workflow.run({ repo: 'octo/example', issueNumber: 1, publish: true }), error => error.code === 'WORKFLOW_REMOTE_MISMATCH');
   setupState.store.close();
 });
