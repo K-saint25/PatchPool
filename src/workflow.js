@@ -336,7 +336,7 @@ export class IssueWorkflow {
   async fail(claim, error, controller) {
     if (!claim) return;
     const current = this.store.getClaim?.(claim.id);
-    if (!current || current.state === 'pr_opened') return;
+    if (!current || current.state === 'pushed' || current.state === 'pr_opened') return;
     try {
       await this.transition(current, 'failed', { errorCode: error.code ?? 'WORKFLOW_FAILED', failedAt: this.clock() }, controller);
     } catch {
@@ -400,8 +400,10 @@ export class IssueWorkflow {
 
   async persistCleanupFailure(claim, controller) {
     if (!claim) return;
+    const current = this.store.getClaim?.(claim.id);
+    if (!current || current.state === 'pushed' || current.state === 'pr_opened') return;
     try {
-      await this.transition(claim, 'failed', { errorCode: 'WORKFLOW_CLEANUP_FAILED', failedAt: this.clock() }, controller);
+      await this.transition(current, 'failed', { errorCode: 'WORKFLOW_CLEANUP_FAILED', failedAt: this.clock() }, controller);
     } catch {
       // The cleanup error remains the observed result even if persistence is unavailable.
     }
