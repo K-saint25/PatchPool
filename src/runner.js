@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { PatchPoolError } from './errors.js';
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_TERMINATION_COMMAND_TIMEOUT_MS = 2_000;
+const DEFAULT_TERMINATION_CONFIRMATION_MS = 2_000;
 const REDACTED = '[REDACTED]';
 
 function escapeRegExp(value) {
@@ -44,17 +46,119 @@ function appendLimited(chunks, state, value, maxBytes) {
   state.bytes += chunk.length;
 }
 
-function spawnOptionsFrom(options) {
+function spawnOptionsFrom(options, platform) {
   const spawnOptions = { shell: false };
   for (const key of ['cwd', 'env', 'uid', 'gid', 'windowsHide', 'detached']) {
     if (options[key] !== undefined) spawnOptions[key] = options[key];
   }
+  if (spawnOptions.detached === undefined && platform !== 'win32') spawnOptions.detached = true;
   return spawnOptions;
 }
 
+function positiveDuration(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function runBoundedTerminationCommand(spawnFn, command, args, timeoutMs) {
+  return new Promise(resolve => {
+    let helperProcess;
+    let timer;
+    let settled = false;
+    const finish = succeeded => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(succeeded);
+    };
+    try {
+      helperProcess = spawnFn(command, args, { shell: false, windowsHide: true, stdio: 'ignore' });
+    } catch {
+      finish(false);
+      return;
+    }
+    helperProcess.once('error', () => finish(false));
+    helperProcess.once('close', exitCode => finish(exitCode === 0));
+    timer = setTimeout(() => {
+      try { helperProcess.kill('SIGKILL'); } catch { /* the helper may already have exited */ }
+      finish(false);
+    }, timeoutMs);
+  });
+}
+
+async function terminateProcessTree(child, {
+  platform,
+  spawnFn,
+  processKillFn,
+  commandTimeoutMs,
+  detached,
+  isClosed,
+}) {
+  if (isClosed()) return true;
+  if (platform === 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
+    return runBoundedTerminationCommand(
+      spawnFn,
+      'taskkill.exe',
+      ['/PID', String(child.pid), '/T', '/F'],
+      commandTimeoutMs,
+    );
+  }
+  if (platform === 'win32') return false;
+  if (platform !== 'win32' && detached === true && Number.isInteger(child.pid) && child.pid > 0) {
+    try {
+      processKillFn(-child.pid, 'SIGTERM');
+      return true;
+    } catch {
+      return isClosed();
+    }
+  }
+  return false;
+}
+
+function waitForManualTermination() {
+  return new Promise(() => {
+    setInterval(() => {}, 24 * 60 * 60 * 1_000);
+  });
+}
+
+function wait(durationMs) {
+  return new Promise(resolve => setTimeout(resolve, durationMs));
+}
+
+async function waitForProcessGroupExit(processKillFn, pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      processKillFn(-pid, 0);
+    } catch (error) {
+      return error?.code === 'ESRCH';
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await wait(Math.min(25, remaining));
+  }
+}
+
 export class CommandRunner {
-  constructor({ spawnFn = spawn, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES, sensitiveValues = [] } = {}) {
+  constructor({
+    spawnFn = spawn,
+    terminationFn,
+    terminationSpawnFn = spawn,
+    processKillFn = process.kill.bind(process),
+    unsafeTerminationWaitFn = waitForManualTermination,
+    platform = process.platform,
+    terminationCommandTimeoutMs = DEFAULT_TERMINATION_COMMAND_TIMEOUT_MS,
+    terminationConfirmationMs = DEFAULT_TERMINATION_CONFIRMATION_MS,
+    maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+    sensitiveValues = [],
+  } = {}) {
     this.spawnFn = spawnFn;
+    this.terminationFn = terminationFn;
+    this.terminationSpawnFn = terminationSpawnFn;
+    this.processKillFn = processKillFn;
+    this.unsafeTerminationWaitFn = unsafeTerminationWaitFn;
+    this.platform = platform;
+    this.terminationCommandTimeoutMs = positiveDuration(terminationCommandTimeoutMs, DEFAULT_TERMINATION_COMMAND_TIMEOUT_MS);
+    this.terminationConfirmationMs = positiveDuration(terminationConfirmationMs, DEFAULT_TERMINATION_CONFIRMATION_MS);
     this.maxOutputBytes = maxOutputBytes;
     this.sensitiveValues = sensitiveValues;
   }
@@ -62,8 +166,9 @@ export class CommandRunner {
   run(command, args = [], options = {}) {
     const timeoutMs = options.timeoutMs;
     const maxOutputBytes = options.maxOutputBytes ?? options.maxCaptureBytes ?? this.maxOutputBytes;
-    const spawnOptions = spawnOptionsFrom(options);
+    const spawnOptions = spawnOptionsFrom(options, this.platform);
     const redact = createRedactor([...this.sensitiveValues, ...(options.sensitiveValues ?? [])]);
+    const abortSignal = options.signal;
 
     return new Promise((resolve, reject) => {
       const stdoutChunks = [];
@@ -73,7 +178,11 @@ export class CommandRunner {
       let child;
       let timer;
       let settled = false;
-      let timedOut = false;
+      let closed = false;
+      let cancellation;
+      let abortHandler;
+      let resolveClosed;
+      const closedPromise = new Promise(resolveClosedPromise => { resolveClosed = resolveClosedPromise; });
 
       const output = () => ({
         stdout: redact(Buffer.concat(stdoutChunks).toString('utf8')),
@@ -84,8 +193,77 @@ export class CommandRunner {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        if (abortHandler && abortSignal) abortSignal.removeEventListener('abort', abortHandler);
         fn(value);
       };
+
+      const waitForClose = durationMs => {
+        if (closed) return Promise.resolve(true);
+        return new Promise(resolve => {
+          let completed = false;
+          const confirmationTimer = setTimeout(() => {
+            if (completed) return;
+            completed = true;
+            resolve(false);
+          }, durationMs);
+          closedPromise.then(() => {
+            if (completed) return;
+            completed = true;
+            clearTimeout(confirmationTimer);
+            resolve(true);
+          });
+        });
+      };
+
+      const requestCancellation = (code, message, details = {}) => {
+        if (settled || cancellation) return;
+        cancellation = { code, message, details };
+        if (timer) clearTimeout(timer);
+        if (abortHandler && abortSignal) abortSignal.removeEventListener('abort', abortHandler);
+        void (async () => {
+          let treeTerminationConfirmed = false;
+          try {
+            const terminate = this.terminationFn ?? ((target, context) => terminateProcessTree(target, context));
+            treeTerminationConfirmed = await terminate(child, {
+              platform: this.platform,
+              spawnFn: this.terminationSpawnFn,
+              processKillFn: this.processKillFn,
+              commandTimeoutMs: this.terminationCommandTimeoutMs,
+              detached: spawnOptions.detached,
+              isClosed: () => closed,
+            }) === true;
+          } catch {
+            // Termination errors can contain secrets and are never surfaced.
+          }
+          if (!treeTerminationConfirmed) {
+            await this.unsafeTerminationWaitFn();
+            return;
+          }
+          const hasProcessGroup = this.platform !== 'win32' && spawnOptions.detached === true && Number.isInteger(child.pid) && child.pid > 0;
+          if (hasProcessGroup) {
+            await wait(this.terminationConfirmationMs);
+            let groupExitConfirmed = false;
+            try {
+              this.processKillFn(-child.pid, 'SIGKILL');
+              groupExitConfirmed = await waitForProcessGroupExit(this.processKillFn, child.pid, this.terminationConfirmationMs);
+            } catch (error) {
+              groupExitConfirmed = error?.code === 'ESRCH';
+            }
+            if (!groupExitConfirmed) {
+              await this.unsafeTerminationWaitFn();
+              return;
+            }
+          } else if (!closed) await waitForClose(this.terminationConfirmationMs);
+          if (!closed) await closedPromise;
+          const captured = output();
+          finish(reject, new PatchPoolError(code, message, { ...details, ...captured }));
+        })();
+      };
+
+      if (abortSignal?.aborted) {
+        finish(reject, new PatchPoolError('COMMAND_ABORTED', `Command was aborted: ${redact(command)}`));
+        return;
+      }
 
       try {
         child = this.spawnFn(command, args, spawnOptions);
@@ -99,6 +277,7 @@ export class CommandRunner {
       child.stdout?.on('data', chunk => appendLimited(stdoutChunks, stdoutState, chunk, maxOutputBytes));
       child.stderr?.on('data', chunk => appendLimited(stderrChunks, stderrState, chunk, maxOutputBytes));
       child.once('error', cause => {
+        if (cancellation) return;
         const captured = output();
         finish(reject, new PatchPoolError('COMMAND_FAILED', `Failed to run command: ${redact(command)}`, {
           ...captured,
@@ -106,27 +285,28 @@ export class CommandRunner {
         }));
       });
       child.once('close', (exitCode, signal) => {
+        if (closed) return;
+        closed = true;
+        resolveClosed();
+        if (cancellation) return;
         const captured = output();
-        if (timedOut) return;
         finish(resolve, { exitCode, ...captured });
       });
+
+      if (abortSignal) {
+        abortHandler = () => {
+          requestCancellation('COMMAND_ABORTED', `Command was aborted: ${redact(command)}`);
+        };
+        abortSignal.addEventListener('abort', abortHandler, { once: true });
+        if (abortSignal.aborted) abortHandler();
+      }
 
       if (options.stdin !== undefined && child.stdin) child.stdin.end(options.stdin);
       else if (child.stdin) child.stdin.end();
 
       if (timeoutMs !== undefined && timeoutMs > 0) {
         timer = setTimeout(() => {
-          timedOut = true;
-          const captured = output();
-          try {
-            child.kill('SIGTERM');
-          } catch {
-            // The process may have exited between the timeout and kill attempt.
-          }
-          finish(reject, new PatchPoolError('COMMAND_TIMEOUT', `Command timed out: ${redact(command)}`, {
-            timeoutMs,
-            ...captured,
-          }));
+          requestCancellation('COMMAND_TIMEOUT', `Command timed out: ${redact(command)}`, { timeoutMs });
         }, timeoutMs);
         timer.unref?.();
       }

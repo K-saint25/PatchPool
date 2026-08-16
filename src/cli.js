@@ -1,5 +1,10 @@
 import { PatchPoolError } from './errors.js';
 import { PatchPoolStore } from './store.js';
+import { CommandRunner } from './runner.js';
+import { GitHubClient } from './github.js';
+import { CodexClient } from './codex.js';
+import { IssueWorkflow } from './workflow.js';
+import { resolveWorkerId } from './worker.js';
 
 function parseArguments(argv) {
   const positional = [];
@@ -14,7 +19,7 @@ function parseArguments(argv) {
     if (key === 'private') {
       throw new PatchPoolError('INVALID_ARGS', 'Private repositories are not eligible for PatchPool claims');
     }
-    if (key === 'json' || key === 'public' || key === 'inactive') {
+    if (key === 'json' || key === 'public' || key === 'inactive' || key === 'publish' || key === 'keep_workspace') {
       options[key] = true;
       continue;
     }
@@ -40,7 +45,7 @@ function required(options, key, label = key) {
 
 function parseVerificationArgv(options) {
   const value = options.verification_argv ?? options.verify_argv;
-  if (value === undefined) return ['npm', 'test'];
+  if (value === undefined) return [process.execPath, '--test'];
   let parsed;
   try { parsed = JSON.parse(value); } catch {
     throw new PatchPoolError('INVALID_ARGS', '--verification-argv must be a JSON string array');
@@ -55,7 +60,7 @@ function emit(stdout, value, json = true) {
   stdout(`${json ? JSON.stringify(value) : String(value)}\n`);
 }
 
-async function dispatch(argv, { store, stdout }) {
+async function dispatch(argv, { store, stdout, workflow, workflowFactory, github, codex, runner, environment = process.env }) {
   const [command, maybeSubcommand, ...remaining] = argv;
   const subcommand = command === 'repo' ? maybeSubcommand : undefined;
   const rest = command === 'repo' ? remaining : [maybeSubcommand, ...remaining].filter(item => item !== undefined);
@@ -100,6 +105,33 @@ async function dispatch(argv, { store, stdout }) {
     return claim;
   }
 
+  if (command === 'doctor') {
+    const commandRunner = runner ?? new CommandRunner();
+    const gh = github ?? new GitHubClient({ runner: commandRunner });
+    const cx = codex ?? new CodexClient({ runner: commandRunner });
+    const result = { github: await gh.preflight(), codex: await cx.preflight() };
+    emit(stdout, result, options.json !== false);
+    return result;
+  }
+
+  if (command === 'run') {
+    const fullName = required(options, 'repo', '--repo');
+    let issueNumber;
+    if (options.issue !== undefined) {
+      issueNumber = Number(options.issue);
+      if (!Number.isInteger(issueNumber) || issueNumber < 1) throw new PatchPoolError('INVALID_ARGS', '--issue must be a positive integer');
+    }
+    const commandRunner = runner ?? new CommandRunner();
+    const gh = github ?? new GitHubClient({ runner: commandRunner });
+    const cx = codex ?? new CodexClient({ runner: commandRunner });
+    const worker = workflow ?? (workflowFactory
+      ? workflowFactory({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment) })
+      : new IssueWorkflow({ store, github: gh, codex: cx, runner: commandRunner, workerId: resolveWorkerId(environment) }));
+    const result = await worker.run({ repo: fullName, issueNumber, publish: options.publish === true, keepWorkspace: options.keep_workspace === true });
+    emit(stdout, result, options.json !== false);
+    return result;
+  }
+
   throw new PatchPoolError('INVALID_ARGS', `Unknown command: ${[command, subcommand].filter(Boolean).join(' ')}`);
 }
 
@@ -108,10 +140,10 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   const store = options.store ?? PatchPoolStore.open(options.dbPath ?? process.env.PATCHPOOL_DB ?? '.patchpool.sqlite');
   const stdout = options.stdout ?? (value => process.stdout.write(value));
   try {
-    return await dispatch(argv, { store, stdout });
+    return await dispatch(argv, { store, stdout, workflow: options.workflow, workflowFactory: options.workflowFactory, github: options.github, codex: options.codex, runner: options.runner, environment: options.environment ?? process.env });
   } finally {
     if (ownsStore) store.close();
   }
 }
 
-export { parseArguments };
+export { parseArguments, resolveWorkerId };
