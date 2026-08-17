@@ -8,8 +8,11 @@ import { IssueWorkflow } from './workflow.js';
 import { resolveWorkerId } from './worker.js';
 import { assertRepositoryApproval, loadRepositoryConfig } from './config.js';
 import { formatDoctor, runDoctor } from './doctor.js';
+import packageJson from '../package.json' with { type: 'json' };
 
 const HELP = `Usage:
+  patchpool --version
+  patchpool version
   patchpool doctor [--json]
   patchpool repo add --repo <owner/name> [--config <path>]
   patchpool repo list [--json]
@@ -274,6 +277,10 @@ async function dispatch(argv, { store, stdout, workflow, workflowFactory, github
 
 export async function main(argv = process.argv.slice(2), options = {}) {
   const stdout = options.stdout ?? (value => process.stdout.write(value));
+  if (argv[0] === '--version' || argv[0] === 'version') {
+    stdout(`${packageJson.version}\n`);
+    return { command: 'version', exitCode: 0 };
+  }
   if (argv[0] === 'help' || argv.includes('--help')) {
     stdout(HELP);
     return { command: 'help', exitCode: 0 };

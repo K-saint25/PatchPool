@@ -10,6 +10,8 @@ import { PatchPoolStore } from '../src/store.js';
 import { main } from '../src/cli.js';
 import { digestApprovedRepositoryConfig } from '../src/config.js';
 
+const PACKAGE_VERSION = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')).version;
+
 function memoryStore() {
   return PatchPoolStore.open(':memory:');
 }
@@ -261,9 +263,33 @@ test('--help prints usage without opening the state database or validating a mod
     stdout: value => output.push(value),
   });
   assert.equal(result.command, 'help');
+  assert.match(output.join(''), /patchpool --version/);
+  assert.match(output.join(''), /patchpool version/);
   assert.match(output.join(''), /patchpool doctor \[--json\]/);
   assert.match(output.join(''), /patchpool repo add/);
   assert.match(output.join(''), /patchpool e2e --repo K-saint25\/PatchPool .*--publish/);
+});
+
+test('version commands print the package version without opening the state database', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'patchpool-version-'));
+  const missingParent = join(directory, 'missing-parent');
+  const dbPath = join(missingParent, 'state.sqlite');
+  try {
+    for (const argument of ['--version', 'version']) {
+      const result = spawnSync(process.execPath, ['bin/patchpool.js', argument], {
+        cwd: process.cwd(),
+        env: { ...process.env, PATCHPOOL_DB: dbPath, PATCHPOOL_CODEX_MODEL: 'invalid model' },
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      assert.equal(result.status, 0);
+      assert.equal(result.stdout, `${PACKAGE_VERSION}\n`);
+      assert.equal(result.stderr, '');
+      assert.equal(existsSync(missingParent), false);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('manual e2e rejects every repository except the exact owner-controlled target', async () => {
